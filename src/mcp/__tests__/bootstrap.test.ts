@@ -8,7 +8,9 @@ import {
   MCP_ENTRYPOINT_MARKER_ENV,
   extractMcpEntrypointMarker,
   isParentProcessAlive,
+  listProcessTable,
   parseProcessTable,
+  parseWindowsProcessTable,
   resolveCurrentMcpEntrypointMarker,
   resolveDuplicateSiblingWatchdogInitialDelayMs,
   shouldAutoStartMcpServer,
@@ -234,6 +236,112 @@ describe('mcp duplicate sibling detection', () => {
     assert.deepEqual(
       parseProcessTable('101 55 node /tmp/dist/mcp/state-server.js\n'),
       [{ pid: 101, ppid: 55, command: 'node /tmp/dist/mcp/state-server.js' }],
+    );
+  });
+
+  it('parses PowerShell CIM process JSON arrays for Windows process tables', () => {
+    assert.deepEqual(
+      parseWindowsProcessTable(JSON.stringify([
+        {
+          ProcessId: 101,
+          ParentProcessId: 55,
+          CommandLine: 'node C:\\tmp\\dist\\mcp\\state-server.js',
+          Name: 'node.exe',
+        },
+        {
+          ProcessId: '140',
+          ParentProcessId: '55',
+          CommandLine: 'node C:\\tmp\\dist\\mcp\\state-server.js',
+          Name: 'node.exe',
+        },
+      ])),
+      [
+        { pid: 101, ppid: 55, command: 'node C:\\tmp\\dist\\mcp\\state-server.js' },
+        { pid: 140, ppid: 55, command: 'node C:\\tmp\\dist\\mcp\\state-server.js' },
+      ],
+    );
+  });
+
+  it('parses single-object PowerShell CIM JSON from one Windows process', () => {
+    assert.deepEqual(
+      parseWindowsProcessTable(JSON.stringify({
+        ProcessId: 101,
+        ParentProcessId: 55,
+        CommandLine: 'node C:\\tmp\\dist\\mcp\\state-server.js',
+      })),
+      [{ pid: 101, ppid: 55, command: 'node C:\\tmp\\dist\\mcp\\state-server.js' }],
+    );
+  });
+
+  it('treats invalid Windows process-table JSON as unavailable', () => {
+    assert.equal(parseWindowsProcessTable('not json'), null);
+  });
+
+  it('uses bounded PowerShell CIM lookup on Windows and falls back to null on failure', () => {
+    const calls: Array<{
+      command: string;
+      args: readonly string[];
+      options: { timeout?: number; maxBuffer?: number };
+    }> = [];
+    const readWindowsProcessTable = (
+      command: string,
+      args: readonly string[] = [],
+      options: { timeout?: number; maxBuffer?: number } = {},
+    ): string => {
+      calls.push({ command, args, options });
+      return JSON.stringify({
+        ProcessId: 101,
+        ParentProcessId: 55,
+        CommandLine: 'node C:\\tmp\\dist\\mcp\\state-server.js',
+      });
+    };
+
+    assert.deepEqual(
+      listProcessTable(
+        readWindowsProcessTable as typeof import('node:child_process').execFileSync,
+        'win32',
+      ),
+      [{ pid: 101, ppid: 55, command: 'node C:\\tmp\\dist\\mcp\\state-server.js' }],
+    );
+    assert.equal(calls[0]?.command, 'powershell.exe');
+    assert.deepEqual(calls[0]?.args.slice(0, 4), [
+      '-NoProfile',
+      '-NonInteractive',
+      '-ExecutionPolicy',
+      'Bypass',
+    ]);
+    assert.ok(calls[0]?.args.includes('Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine,Name | ConvertTo-Json -Compress'));
+    assert.equal(calls[0]?.options.timeout, 2_000);
+    assert.equal(calls[0]?.options.maxBuffer, 4 * 1024 * 1024);
+
+    const failingRead = (() => {
+      throw new Error('powershell unavailable');
+    }) as typeof import('node:child_process').execFileSync;
+    assert.equal(listProcessTable(failingRead, 'win32'), null);
+  });
+
+  it('detects duplicate Windows siblings through the process-table watchdog path', () => {
+    const processes = parseWindowsProcessTable(JSON.stringify([
+      {
+        ProcessId: 101,
+        ParentProcessId: 55,
+        CommandLine: 'node C:\\tmp\\dist\\mcp\\state-server.js',
+      },
+      {
+        ProcessId: 140,
+        ParentProcessId: 55,
+        CommandLine: 'node C:\\tmp\\dist\\mcp\\state-server.js',
+      },
+    ]));
+
+    assert.ok(processes, 'Windows process table should parse');
+    const older = analyzeDuplicateSiblingState(processes, 101, 55, 'state-server.js');
+
+    assert.equal(older.status, 'older_duplicate');
+    assert.deepEqual(older.newerSiblingPids, [140]);
+    assert.equal(
+      shouldSelfExitForDuplicateSibling(older, 11_100, 9_000, null),
+      true,
     );
   });
 
