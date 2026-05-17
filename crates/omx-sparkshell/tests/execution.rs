@@ -534,3 +534,51 @@ fn json_mode_reports_failed_command_details() {
     assert!(stdout.contains("\"exit_code\": 9"));
     assert!(stdout.contains("bad"));
 }
+
+#[test]
+fn json_mode_classifies_auth_errors() {
+    let output = Command::new(sparkshell_bin())
+        .arg("--json")
+        .arg("sh")
+        .arg("-c")
+        .arg("printf 'Authorization failed\n' >&2; exit 1")
+        .output()
+        .expect("run sparkshell");
+
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\"classification\": \"auth_error\""));
+    assert!(stdout.contains("authentication-like error"));
+}
+
+#[test]
+fn json_mode_reads_team_state_from_env_root() {
+    let temp = unique_temp_dir("team-state");
+    let worker_dir = temp.join("team/demo/workers/worker-1");
+    fs::create_dir_all(&worker_dir).expect("worker dir");
+    fs::write(
+        worker_dir.join("status.json"),
+        r#"{"state":"busy","task":"in_progress"}"#,
+    )
+    .expect("status");
+
+    let output = Command::new(sparkshell_bin())
+        .env("OMX_TEAM_STATE_ROOT", temp.display().to_string())
+        .arg("--json")
+        .arg("--team")
+        .arg("demo")
+        .arg("--worker")
+        .arg("worker-1")
+        .arg("sh")
+        .arg("-c")
+        .arg("printf 'quiet\n'")
+        .output()
+        .expect("run sparkshell");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\"classification\": \"busy_processing\""));
+    assert!(stdout.contains("do not shutdown yet"));
+
+    let _ = fs::remove_dir_all(temp);
+}

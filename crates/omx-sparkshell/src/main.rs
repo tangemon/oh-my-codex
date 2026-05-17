@@ -12,8 +12,10 @@ use crate::exec::{execute_command, CommandOutput};
 use crate::threshold::{combined_visible_lines, read_line_threshold};
 use omx_mux::build_capture_pane_args;
 use std::collections::hash_map::DefaultHasher;
+use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::process;
 
 const DEFAULT_TMUX_TAIL_LINES: usize = 200;
@@ -31,6 +33,8 @@ struct SparkShellOptions {
     target: SparkShellTarget,
     json: bool,
     budget: usize,
+    team: Option<String>,
+    worker: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +48,7 @@ struct Evidence {
 }
 
 const DEFAULT_BUDGET: usize = 1000;
+const STALE_HEARTBEAT_MS: u64 = 120_000;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -149,6 +154,8 @@ fn parse_input(args: &[String]) -> Result<SparkShellOptions, SparkshellError> {
     let mut positional = Vec::new();
     let mut json = false;
     let mut budget = DEFAULT_BUDGET;
+    let mut team = None;
+    let mut worker = None;
 
     let mut index = 0;
     while index < args.len() {
@@ -170,6 +177,46 @@ fn parse_input(args: &[String]) -> Result<SparkShellOptions, SparkshellError> {
         }
         if let Some(value) = token.strip_prefix("--budget=") {
             budget = parse_positive_usize(value, "--budget")?;
+            index += 1;
+            continue;
+        }
+        if token == "--team" {
+            let Some(next) = args.get(index + 1) else {
+                return Err(SparkshellError::InvalidArgs(
+                    "--team requires a value".to_string(),
+                ));
+            };
+            team = Some(next.clone());
+            index += 2;
+            continue;
+        }
+        if let Some(value) = token.strip_prefix("--team=") {
+            if value.trim().is_empty() {
+                return Err(SparkshellError::InvalidArgs(
+                    "--team requires a value".to_string(),
+                ));
+            }
+            team = Some(value.to_string());
+            index += 1;
+            continue;
+        }
+        if token == "--worker" {
+            let Some(next) = args.get(index + 1) else {
+                return Err(SparkshellError::InvalidArgs(
+                    "--worker requires a value".to_string(),
+                ));
+            };
+            worker = Some(next.clone());
+            index += 2;
+            continue;
+        }
+        if let Some(value) = token.strip_prefix("--worker=") {
+            if value.trim().is_empty() {
+                return Err(SparkshellError::InvalidArgs(
+                    "--worker requires a value".to_string(),
+                ));
+            }
+            worker = Some(value.to_string());
             index += 1;
             continue;
         }
@@ -243,6 +290,8 @@ fn parse_input(args: &[String]) -> Result<SparkShellOptions, SparkshellError> {
         target,
         json,
         budget,
+        team,
+        worker,
     })
 }
 
@@ -348,6 +397,137 @@ fn optional_json_string(value: &Option<String>) -> String {
         .unwrap_or_else(|| "null".to_string())
 }
 
+#[derive(Debug, Clone)]
+struct Diagnostics {
+    classification: String,
+    next_action: String,
+    confidence: f32,
+    errors: Vec<String>,
+    warnings: Vec<String>,
+}
+
+fn classify(options: &SparkShellOptions, output: &CommandOutput) -> Diagnostics {
+    let text = combined_text(output).to_ascii_lowercase();
+    let mut diagnostics = Diagnostics {
+        classification: "unknown".to_string(),
+        next_action: "inspect raw output".to_string(),
+        confidence: 0.45,
+        errors: Vec::new(),
+        warnings: Vec::new(),
+    };
+
+    if text.contains("authorization") || text.contains("authentication") || text.contains("401") {
+        diagnostics.classification = "auth_error".to_string();
+        diagnostics.confidence = 0.8;
+        diagnostics
+            .errors
+            .push("authentication-like error in output".to_string());
+    } else if text.contains("typeerror") || text.contains("type error") {
+        diagnostics.classification = "type_error".to_string();
+        diagnostics.confidence = 0.75;
+        diagnostics
+            .errors
+            .push("type error pattern in output".to_string());
+    } else if text.contains("test failed") || text.contains("failures:") || text.contains("failed")
+    {
+        diagnostics.classification = "test_failure".to_string();
+        diagnostics.confidence = 0.65;
+        diagnostics
+            .errors
+            .push("failure pattern in output".to_string());
+    } else if text.contains("press enter")
+        || text.contains("waiting for input")
+        || text.contains("continue?")
+    {
+        diagnostics.classification = "waiting_for_input".to_string();
+        diagnostics.confidence = 0.75;
+    } else if text.contains("thinking") || text.contains("running") || text.contains("building") {
+        diagnostics.classification = "busy_processing".to_string();
+        diagnostics.next_action = "wait".to_string();
+        diagnostics.confidence = 0.65;
+        diagnostics.warnings.push("do not shutdown yet".to_string());
+    }
+
+    if let (Some(team), Some(worker)) = (&options.team, &options.worker) {
+        if let Some(team_diagnostics) = classify_team(team, worker) {
+            diagnostics = team_diagnostics;
+        }
+    }
+
+    diagnostics
+}
+
+fn classify_team(team: &str, worker: &str) -> Option<Diagnostics> {
+    let state_root = std::env::var("OMX_TEAM_STATE_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(".omx/state"));
+    let base = state_root
+        .join("team")
+        .join(team)
+        .join("workers")
+        .join(worker);
+    if !base.exists() {
+        return None;
+    }
+
+    if let Ok(heartbeat) = fs::read_to_string(base.join("heartbeat.json")) {
+        if let Some(timestamp) = extract_number_after(&heartbeat, "timestamp")
+            .or_else(|| extract_number_after(&heartbeat, "updated_at_ms"))
+        {
+            if now_ms().saturating_sub(timestamp) > STALE_HEARTBEAT_MS {
+                return Some(Diagnostics {
+                    classification: "stale_heartbeat".to_string(),
+                    next_action: "run omx team status".to_string(),
+                    confidence: 0.78,
+                    errors: Vec::new(),
+                    warnings: vec!["heartbeat is stale".to_string()],
+                });
+            }
+        }
+    }
+
+    if let Ok(status) = fs::read_to_string(base.join("status.json")) {
+        let normalized = status.to_ascii_lowercase();
+        if normalized.contains("blocked") || normalized.contains("needs_input") {
+            return Some(Diagnostics {
+                classification: "waiting_for_input".to_string(),
+                next_action: "inspect raw pane".to_string(),
+                confidence: 0.7,
+                errors: Vec::new(),
+                warnings: Vec::new(),
+            });
+        }
+        if normalized.contains("busy") || normalized.contains("in_progress") {
+            return Some(Diagnostics {
+                classification: "busy_processing".to_string(),
+                next_action: "wait".to_string(),
+                confidence: 0.72,
+                errors: Vec::new(),
+                warnings: vec!["do not shutdown yet".to_string()],
+            });
+        }
+    }
+
+    None
+}
+
+fn extract_number_after(text: &str, key: &str) -> Option<u64> {
+    let start = text.find(key)?;
+    let digits: String = text[start + key.len()..]
+        .chars()
+        .skip_while(|ch| !ch.is_ascii_digit())
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 fn write_json_report(
     options: &SparkShellOptions,
     output: &CommandOutput,
@@ -363,12 +543,12 @@ fn write_json_report(
     } else {
         "failed"
     };
-    let errors = if output.status.success() {
-        Vec::new()
-    } else {
-        vec![compact_text(&output.stderr_text(), options.budget)]
-    };
-    let warnings: Vec<String> = Vec::new();
+    let mut diagnostics = classify(options, output);
+    if !output.status.success() && diagnostics.errors.is_empty() {
+        diagnostics
+            .errors
+            .push(compact_text(&output.stderr_text(), options.budget));
+    }
     let tail_lines = evidence
         .tail_lines
         .map(|value| value.to_string())
@@ -385,7 +565,8 @@ fn write_json_report(
             "  \"warnings\": {},\n",
             "  \"evidence\": {{\"stdout_lines\":{},\"stderr_lines\":{},\"raw_hash\":{},\"pane_id\":{},\"tail_lines\":{},\"line_range\":{}}},\n",
             "  \"next_action\": {},\n",
-            "  \"confidence\": 0.80\n",
+            "  \"confidence\": {:.2},\n",
+            "  \"classification\": {}\n",
             "}}\n"
         ),
         output.status.success(),
@@ -393,15 +574,17 @@ fn write_json_report(
         json_str(status),
         output.exit_code(),
         json_str(&compact_text(summary, options.budget)),
-        json_string_array(&errors),
-        json_string_array(&warnings),
+        json_string_array(&diagnostics.errors),
+        json_string_array(&diagnostics.warnings),
         evidence.stdout_lines,
         evidence.stderr_lines,
         json_str(&evidence.raw_hash),
         optional_json_string(&evidence.pane_id),
         tail_lines,
         optional_json_string(&evidence.line_range),
-        json_str(if output.status.success() { "none" } else { "inspect raw output" }),
+        json_str(&diagnostics.next_action),
+        diagnostics.confidence,
+        json_str(&diagnostics.classification),
     );
     io::stdout().write_all(json.as_bytes())?;
     Ok(())
