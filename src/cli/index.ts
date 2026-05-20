@@ -8,6 +8,7 @@ import { basename, dirname, join, posix, win32 } from "path";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "fs";
 import { copyFile, cp, lstat, mkdir, readFile, readdir, rm, symlink, writeFile } from "fs/promises";
 import { constants as osConstants, homedir } from "os";
+import { createHash } from "crypto";
 import {
   setup,
   SETUP_MCP_MODES,
@@ -1220,17 +1221,221 @@ function sanitizeRunIdSegment(value: string): string {
   return value.replace(/[^a-zA-Z0-9._-]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
 }
 
+const MADMAX_DETACHED_ACTIVE_DIR = "active-detached";
+const MADMAX_DETACHED_LOCK_STALE_MS = 30_000;
+const MADMAX_DETACHED_LOCK_RETRY_MS = 50;
+const MADMAX_DETACHED_LOCK_MAX_ATTEMPTS = 100;
+const OMX_MADMAX_DETACHED_CONTEXT_ENV = "OMX_MADMAX_DETACHED_CONTEXT";
+
+interface MadmaxDetachedActiveRecord {
+  version: 1;
+  context_key: string;
+  created_at: string;
+  source_cwd: string;
+  argv: string[];
+  run_dir: string;
+  tmux_session_name: string;
+}
+
+function resolveMadmaxRunsRoot(env: NodeJS.ProcessEnv = process.env): string {
+  return env.OMX_RUNS_DIR || join(homedir(), ".omx-runs");
+}
+
+function canonicalizeLaunchCwd(cwd: string): string {
+  try {
+    return execFileSync("git", ["rev-parse", "--show-toplevel"], {
+      cwd,
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim() || cwd;
+  } catch {
+    return cwd;
+  }
+}
+
+function normalizeMadmaxDetachedLaunchArgv(argv: readonly string[]): string[] {
+  const passthrough: string[] = [];
+  const semanticFlags = new Set<string>();
+  let reasoningFlag: string | null = null;
+  let afterEndOfOptions = false;
+
+  for (const arg of argv) {
+    if (afterEndOfOptions) {
+      passthrough.push(arg);
+      continue;
+    }
+    if (arg === "--") {
+      afterEndOfOptions = true;
+      passthrough.push(arg);
+      continue;
+    }
+    if (arg === "--tmux" || arg === "--direct") {
+      continue;
+    }
+    if (
+      arg === MADMAX_FLAG ||
+      arg === MADMAX_SPARK_FLAG
+    ) {
+      semanticFlags.add(arg);
+      continue;
+    }
+    if (arg === HIGH_REASONING_FLAG || arg === XHIGH_REASONING_FLAG) {
+      reasoningFlag = arg;
+      continue;
+    }
+    passthrough.push(arg);
+  }
+
+  return [
+    ...Array.from(semanticFlags).sort(),
+    ...(reasoningFlag ? [reasoningFlag] : []),
+    ...passthrough,
+  ];
+}
+
+export function buildMadmaxDetachedLaunchContextKey(
+  sourceCwd: string,
+  argv: readonly string[],
+): string {
+  const payload = JSON.stringify({
+    source_cwd: canonicalizeLaunchCwd(sourceCwd),
+    argv: normalizeMadmaxDetachedLaunchArgv(argv),
+  });
+  return createHash("sha256").update(payload).digest("hex").slice(0, 32);
+}
+
+function madmaxDetachedActiveRecordPath(
+  runsRoot: string,
+  contextKey: string,
+): string {
+  return join(runsRoot, MADMAX_DETACHED_ACTIVE_DIR, `${contextKey}.json`);
+}
+
+function readMadmaxDetachedActiveRecord(
+  recordPath: string,
+): MadmaxDetachedActiveRecord | null {
+  if (!existsSync(recordPath)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(recordPath, "utf-8")) as Partial<MadmaxDetachedActiveRecord>;
+    if (
+      parsed.version !== 1 ||
+      typeof parsed.context_key !== "string" ||
+      typeof parsed.source_cwd !== "string" ||
+      typeof parsed.run_dir !== "string" ||
+      typeof parsed.tmux_session_name !== "string" ||
+      !Array.isArray(parsed.argv) ||
+      !parsed.argv.every((arg) => typeof arg === "string")
+    ) {
+      return null;
+    }
+    return {
+      version: 1,
+      context_key: parsed.context_key,
+      created_at: typeof parsed.created_at === "string" ? parsed.created_at : "",
+      source_cwd: parsed.source_cwd,
+      argv: [...parsed.argv],
+      run_dir: parsed.run_dir,
+      tmux_session_name: parsed.tmux_session_name,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function detachedTmuxSessionExists(sessionName: string): boolean {
+  try {
+    execTmuxFileSync(["has-session", "-t", sessionName], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function withMadmaxDetachedContextLock<T>(
+  runsRoot: string,
+  contextKey: string,
+  run: () => T,
+): T {
+  const lockPath = join(runsRoot, MADMAX_DETACHED_ACTIVE_DIR, `${contextKey}.lock`);
+  mkdirSync(dirname(lockPath), { recursive: true });
+  for (let attempt = 0; attempt < MADMAX_DETACHED_LOCK_MAX_ATTEMPTS; attempt++) {
+    try {
+      mkdirSync(lockPath);
+      try {
+        writeFileSync(join(lockPath, "pid"), String(process.pid));
+        return run();
+      } finally {
+        rmSync(lockPath, { recursive: true, force: true });
+      }
+    } catch (err) {
+      const code =
+        err && typeof err === "object" && "code" in err
+          ? String((err as NodeJS.ErrnoException).code)
+          : "";
+      if (code !== "EEXIST") throw err;
+      const lockStat = statSync(lockPath, { throwIfNoEntry: false });
+      if (lockStat && Date.now() - lockStat.mtimeMs > MADMAX_DETACHED_LOCK_STALE_MS) {
+        let holderAlive = false;
+        try {
+          const holderPid = Number.parseInt(readFileSync(join(lockPath, "pid"), "utf-8").trim(), 10);
+          if (Number.isSafeInteger(holderPid) && holderPid > 0) {
+            process.kill(holderPid, 0);
+            holderAlive = true;
+          }
+        } catch {
+          holderAlive = false;
+        }
+        if (!holderAlive) {
+          rmSync(lockPath, { recursive: true, force: true });
+          continue;
+        }
+      }
+      blockMs(MADMAX_DETACHED_LOCK_RETRY_MS);
+    }
+  }
+  throw new MadmaxDetachedGuardError(`timed out waiting for madmax detached launch context lock: ${lockPath}`);
+}
+
+function isMadmaxDetachedGuardEnabled(env: NodeJS.ProcessEnv): boolean {
+  return env.OMXBOX_ACTIVE === "1" && typeof env[OMX_MADMAX_DETACHED_CONTEXT_ENV] === "string";
+}
+
+function cleanupCurrentMadmaxReuseRunRoot(env: NodeJS.ProcessEnv, runsRoot: string): void {
+  const runRoot = env.OMX_ROOT;
+  if (!runRoot || !env.OMXBOX_ACTIVE) return;
+  const normalizedRunsRoot = runsRoot.endsWith("/") ? runsRoot : `${runsRoot}/`;
+  if (runRoot !== runsRoot && !runRoot.startsWith(normalizedRunsRoot)) return;
+  rmSync(runRoot, { recursive: true, force: true });
+}
+
+function writeMadmaxDetachedActiveRecord(
+  recordPath: string,
+  record: MadmaxDetachedActiveRecord,
+): void {
+  mkdirSync(dirname(recordPath), { recursive: true });
+  writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+}
+
+class MadmaxDetachedReuseError extends Error {
+  readonly failClosed = true;
+}
+
+class MadmaxDetachedGuardError extends Error {
+  readonly failClosed = true;
+}
+
 export function createMadmaxIsolatedRoot(
   sourceCwd: string,
   argv: string[],
   env: NodeJS.ProcessEnv = process.env,
 ): string {
-  const runsRoot = env.OMX_RUNS_DIR || join(homedir(), ".omx-runs");
+  const runsRoot = resolveMadmaxRunsRoot(env);
   mkdirSync(runsRoot, { recursive: true });
   const stamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
   const suffix = Math.random().toString(16).slice(2, 6);
   const runDir = join(runsRoot, sanitizeRunIdSegment(`run-${stamp}-${suffix}`));
   mkdirSync(runDir, { recursive: false });
+  const detachedLaunchContext = buildMadmaxDetachedLaunchContextKey(sourceCwd, argv);
 
   const metadata = {
     launcher: "omx --madmax",
@@ -1238,9 +1443,11 @@ export function createMadmaxIsolatedRoot(
     cwd: runDir,
     source_cwd: sourceCwd,
     argv,
+    detached_launch_context: detachedLaunchContext,
   };
   writeFileSync(join(runDir, ".omxbox-run.json"), `${JSON.stringify(metadata, null, 2)}\n`);
   writeFileSync(join(runsRoot, "registry.jsonl"), `${JSON.stringify(metadata)}\n`, { flag: "a" });
+  env[OMX_MADMAX_DETACHED_CONTEXT_ENV] = detachedLaunchContext;
   return runDir;
 }
 
@@ -3692,161 +3899,224 @@ function runCodex(
       ? buildWindowsPromptCommand("codex", launchArgs)
       : null;
     const sessionName = buildDetachedTmuxSessionName(cwd, sessionId);
-    void writeSessionStart(cwd, sessionId, { tmuxSessionName: sessionName }).catch((err) => {
-      logCliOperationFailure(err);
-      // Non-fatal: managed tmux recovery can still use compatibility fallback.
-    });
-    let createdDetachedSession = false;
-    let registeredHookTarget: string | null = null;
-    let registeredHookName: string | null = null;
-    let registeredClientAttachedHookName: string | null = null;
-    let detachedParentEnvFilePath: string | undefined;
-    try {
-      // This path is the user-shell interactive launch: OMX creates a tmux
-      // session and immediately attaches the user's terminal to it. If a tmux
-      // server already exists, `new-session -e` only forwards explicit values,
-      // so provider-specific parent-shell keys would disappear. Source a
-      // private env file inside the leader shell instead of putting every
-      // parent env value on the tmux command line or in logs.
-      if (!nativeWindows) {
-        detachedParentEnvFilePath = writeDetachedSessionParentEnvFile(
-          cwd,
-          sessionId,
-          codexEnvWithNotify,
+    const launchDetachedSession = (): { postLaunchHandledExternally: boolean } => {
+      const contextKey = process.env[OMX_MADMAX_DETACHED_CONTEXT_ENV]?.trim();
+      const runsRoot = resolveMadmaxRunsRoot(process.env);
+      const activeRecordPath = contextKey
+        ? madmaxDetachedActiveRecordPath(runsRoot, contextKey)
+        : null;
+      const activeRecord = activeRecordPath
+        ? readMadmaxDetachedActiveRecord(activeRecordPath)
+        : null;
+      if (
+        activeRecord &&
+        activeRecord.context_key === contextKey &&
+        detachedTmuxSessionExists(activeRecord.tmux_session_name)
+      ) {
+        cleanupCurrentMadmaxReuseRunRoot(process.env, runsRoot);
+        process.stderr.write(
+          `[omx] madmax detached launch already active for this context; attaching ${activeRecord.tmux_session_name} instead of starting a duplicate.\n`,
         );
-      }
-      const bootstrapSteps = buildDetachedSessionBootstrapSteps(
-        sessionName,
-        cwd,
-        codexCmd,
-        hudCmd,
-        workerLaunchArgs,
-        codexHomeOverride,
-        notifyTempContractRaw,
-        nativeWindows,
-        sessionId,
-        projectLocalCodexHomeForCleanup,
-        runtimeCodexHomeForCleanup,
-        omxRootOverride,
-        process.env,
-        sqliteHomeOverride,
-        detachedParentEnvFilePath,
-      );
-      for (const step of bootstrapSteps) {
-        const output = execTmuxFileSync(step.args, {
-          stdio: "pipe",
-          encoding: "utf-8",
-        });
-        if (step.name === "new-session") {
-          createdDetachedSession = true;
-          parsePaneIdFromTmuxOutput(output || "");
-        }
-        if (step.name === "split-and-capture-hud-pane") {
-          const hudPaneId = parsePaneIdFromTmuxOutput(output || "");
-          const hookWindowIndex = hudPaneId
-            ? detectDetachedSessionWindowIndex(sessionName)
-            : null;
-          const hookTarget =
-            hudPaneId && hookWindowIndex
-              ? buildResizeHookTarget(sessionName, hookWindowIndex)
-              : null;
-          const hookName =
-            hudPaneId && hookWindowIndex
-              ? buildResizeHookName(
-                  "launch",
-                  sessionName,
-                  hookWindowIndex,
-                  hudPaneId,
-                )
-              : null;
-          const clientAttachedHookName =
-            hudPaneId && hookWindowIndex
-              ? buildClientAttachedReconcileHookName(
-                  "launch",
-                  sessionName,
-                  hookWindowIndex,
-                  hudPaneId,
-                )
-              : null;
-          const finalizeSteps = buildDetachedSessionFinalizeSteps(
-            sessionName,
-            hudPaneId,
-            hookWindowIndex,
-            process.env.OMX_MOUSE !== "0",
-            nativeWindows,
+        try {
+          execTmuxFileSync(["attach-session", "-t", activeRecord.tmux_session_name], {
+            stdio: "inherit",
+          });
+        } catch (err) {
+          logCliOperationFailure(err);
+          throw new MadmaxDetachedReuseError(
+            `refusing duplicate madmax detached launch: existing session ${activeRecord.tmux_session_name} is active but attach failed`,
           );
-          if (nativeWindows && detachedWindowsCodexCmd) {
-            scheduleDetachedWindowsCodexLaunch(
-              sessionName,
-              detachedWindowsCodexCmd,
-            );
+        }
+        return { postLaunchHandledExternally: true };
+      }
+      if (activeRecordPath && activeRecord) {
+        rmSync(activeRecordPath, { force: true });
+      }
+
+      void writeSessionStart(cwd, sessionId, { tmuxSessionName: sessionName }).catch((err) => {
+        logCliOperationFailure(err);
+        // Non-fatal: managed tmux recovery can still use compatibility fallback.
+      });
+      let createdDetachedSession = false;
+      let registeredHookTarget: string | null = null;
+      let registeredHookName: string | null = null;
+      let registeredClientAttachedHookName: string | null = null;
+      let detachedParentEnvFilePath: string | undefined;
+      try {
+        // This path is the user-shell interactive launch: OMX creates a tmux
+        // session and immediately attaches the user's terminal to it. If a tmux
+        // server already exists, `new-session -e` only forwards explicit values,
+        // so provider-specific parent-shell keys would disappear. Source a
+        // private env file inside the leader shell instead of putting every
+        // parent env value on the tmux command line or in logs.
+        if (!nativeWindows) {
+          detachedParentEnvFilePath = writeDetachedSessionParentEnvFile(
+            cwd,
+            sessionId,
+            codexEnvWithNotify,
+          );
+        }
+        const bootstrapSteps = buildDetachedSessionBootstrapSteps(
+          sessionName,
+          cwd,
+          codexCmd,
+          hudCmd,
+          workerLaunchArgs,
+          codexHomeOverride,
+          notifyTempContractRaw,
+          nativeWindows,
+          sessionId,
+          projectLocalCodexHomeForCleanup,
+          runtimeCodexHomeForCleanup,
+          omxRootOverride,
+          process.env,
+          sqliteHomeOverride,
+          detachedParentEnvFilePath,
+        );
+        for (const step of bootstrapSteps) {
+          const output = execTmuxFileSync(step.args, {
+            stdio: "pipe",
+            encoding: "utf-8",
+          });
+          if (step.name === "new-session") {
+            createdDetachedSession = true;
+            if (activeRecordPath && contextKey) {
+              writeMadmaxDetachedActiveRecord(activeRecordPath, {
+                version: 1,
+                context_key: contextKey,
+                created_at: new Date().toISOString(),
+                source_cwd: process.env.OMX_SOURCE_CWD || cwd,
+                argv: args,
+                run_dir: process.env.OMX_ROOT || cwd,
+                tmux_session_name: sessionName,
+              });
+            }
+            parsePaneIdFromTmuxOutput(output || "");
           }
-          for (const finalizeStep of finalizeSteps) {
-            if (finalizeStep.name === "sanitize-copy-mode-style") {
+          if (step.name === "split-and-capture-hud-pane") {
+            const hudPaneId = parsePaneIdFromTmuxOutput(output || "");
+            const hookWindowIndex = hudPaneId
+              ? detectDetachedSessionWindowIndex(sessionName)
+              : null;
+            const hookTarget =
+              hudPaneId && hookWindowIndex
+                ? buildResizeHookTarget(sessionName, hookWindowIndex)
+                : null;
+            const hookName =
+              hudPaneId && hookWindowIndex
+                ? buildResizeHookName(
+                    "launch",
+                    sessionName,
+                    hookWindowIndex,
+                    hudPaneId,
+                  )
+                : null;
+            const clientAttachedHookName =
+              hudPaneId && hookWindowIndex
+                ? buildClientAttachedReconcileHookName(
+                    "launch",
+                    sessionName,
+                    hookWindowIndex,
+                    hudPaneId,
+                  )
+                : null;
+            const finalizeSteps = buildDetachedSessionFinalizeSteps(
+              sessionName,
+              hudPaneId,
+              hookWindowIndex,
+              process.env.OMX_MOUSE !== "0",
+              nativeWindows,
+            );
+            if (nativeWindows && detachedWindowsCodexCmd) {
+              scheduleDetachedWindowsCodexLaunch(
+                sessionName,
+                detachedWindowsCodexCmd,
+              );
+            }
+            for (const finalizeStep of finalizeSteps) {
+              if (finalizeStep.name === "sanitize-copy-mode-style") {
+                try {
+                  mitigateCopyModeUnderlineArtifacts(sessionName);
+                } catch (err) {
+                  logCliOperationFailure(err);
+                }
+                continue;
+              }
+              const stdio =
+                finalizeStep.name === "attach-session" ? "inherit" : "ignore";
               try {
-                mitigateCopyModeUnderlineArtifacts(sessionName);
+                const startedAtMs = Date.now();
+                execTmuxFileSync(finalizeStep.args, { stdio });
+                if (finalizeStep.name === "attach-session") {
+                  assertDetachedAttachDidNotNoop(
+                    sessionName,
+                    Date.now() - startedAtMs,
+                    process.env,
+                  );
+                }
               } catch (err) {
                 logCliOperationFailure(err);
+                if (finalizeStep.name === "attach-session")
+                  throw new Error("failed to attach detached tmux session");
+                continue;
               }
-              continue;
+              if (
+                finalizeStep.name === "register-resize-hook" &&
+                hookTarget &&
+                hookName
+              ) {
+                registeredHookTarget = hookTarget;
+                registeredHookName = hookName;
+              }
+              if (
+                finalizeStep.name === "register-client-attached-reconcile" &&
+                clientAttachedHookName
+              ) {
+                registeredClientAttachedHookName = clientAttachedHookName;
+              }
             }
-            const stdio =
-              finalizeStep.name === "attach-session" ? "inherit" : "ignore";
+          }
+        }
+        return { postLaunchHandledExternally: !nativeWindows };
+      } catch (err) {
+        if (detachedParentEnvFilePath) {
+          rmSync(detachedParentEnvFilePath, { force: true });
+        }
+        if (activeRecordPath) {
+          rmSync(activeRecordPath, { force: true });
+        }
+        if (createdDetachedSession) {
+          const rollbackSteps = buildDetachedSessionRollbackSteps(
+            sessionName,
+            registeredHookTarget,
+            registeredHookName,
+            registeredClientAttachedHookName,
+          );
+          for (const rollbackStep of rollbackSteps) {
             try {
-              const startedAtMs = Date.now();
-              execTmuxFileSync(finalizeStep.args, { stdio });
-              if (finalizeStep.name === "attach-session") {
-                assertDetachedAttachDidNotNoop(
-                  sessionName,
-                  Date.now() - startedAtMs,
-                  process.env,
-                );
-              }
-            } catch (err) {
-              logCliOperationFailure(err);
-              if (finalizeStep.name === "attach-session")
-                throw new Error("failed to attach detached tmux session");
-              continue;
-            }
-            if (
-              finalizeStep.name === "register-resize-hook" &&
-              hookTarget &&
-              hookName
-            ) {
-              registeredHookTarget = hookTarget;
-              registeredHookName = hookName;
-            }
-            if (
-              finalizeStep.name === "register-client-attached-reconcile" &&
-              clientAttachedHookName
-            ) {
-              registeredClientAttachedHookName = clientAttachedHookName;
+              execTmuxFileSync(rollbackStep.args, { stdio: "ignore" });
+            } catch (rollbackErr) {
+              logCliOperationFailure(rollbackErr);
+              // best-effort rollback only
             }
           }
         }
+        throw err;
       }
-      return { postLaunchHandledExternally: !nativeWindows };
+    };
+
+    const contextKey = process.env[OMX_MADMAX_DETACHED_CONTEXT_ENV]?.trim();
+    const runsRoot = resolveMadmaxRunsRoot(process.env);
+    try {
+      if (isMadmaxDetachedGuardEnabled(process.env) && contextKey) {
+        return withMadmaxDetachedContextLock(runsRoot, contextKey, launchDetachedSession);
+      }
+      return launchDetachedSession();
     } catch (err) {
+      if (err instanceof MadmaxDetachedReuseError || err instanceof MadmaxDetachedGuardError) {
+        throw err;
+      }
       logCliOperationFailure(err);
-      if (detachedParentEnvFilePath) {
-        rmSync(detachedParentEnvFilePath, { force: true });
-      }
-      if (createdDetachedSession) {
-        const rollbackSteps = buildDetachedSessionRollbackSteps(
-          sessionName,
-          registeredHookTarget,
-          registeredHookName,
-          registeredClientAttachedHookName,
-        );
-        for (const rollbackStep of rollbackSteps) {
-          try {
-            execTmuxFileSync(rollbackStep.args, { stdio: "ignore" });
-          } catch (err) {
-            logCliOperationFailure(err);
-            // best-effort rollback only
-          }
-        }
-      }
       // tmux not available or failed, just run codex directly
       runCodexBlocking(cwd, launchArgs, codexEnvWithNotify);
       return { postLaunchHandledExternally: false };

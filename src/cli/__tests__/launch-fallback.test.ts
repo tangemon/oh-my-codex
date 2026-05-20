@@ -92,6 +92,11 @@ async function createLaunchFixture(
       OMX_AUTO_UPDATE: '0',
       OMX_NOTIFY_FALLBACK: '0',
       OMX_HOOK_DERIVED_SIGNALS: '0',
+      OMX_ROOT: '',
+      OMX_STATE_ROOT: '',
+      OMXBOX_ACTIVE: '',
+      OMX_SOURCE_CWD: '',
+      OMX_MADMAX_DETACHED_CONTEXT: '',
     },
   };
 }
@@ -294,6 +299,130 @@ printf 'fake-codex:%s\n' "$*"
 });
 
 describe('omx launcher when tmux is available', () => {
+  it('reuses an active madmax detached launch context instead of spawning duplicate tmux sessions', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-launch-madmax-reuse-'));
+    try {
+      const runs = join(wd, 'runs');
+      const activeMarker = join(wd, 'active-session');
+      const { env, tmuxLogPath } = await createLaunchFixture(
+        wd,
+        (logPath) => `#!/bin/sh
+printf 'tmux:%s\n' "$*" >> "${logPath}"
+case "$1" in
+  -V)
+    printf 'tmux 3.4\n'
+    exit 0
+    ;;
+  has-session)
+    test -f "${activeMarker}"
+    exit $?
+    ;;
+  new-session)
+    printf '%s\n' "$*" > "${activeMarker}"
+    printf 'leader-pane\n'
+    exit 0
+    ;;
+  split-window)
+    printf 'hud-pane\n'
+    exit 0
+    ;;
+  display-message)
+    if [ "$2" = '-p' ] && [ "$3" = '#{socket_path}' ]; then
+      printf '/tmp/tmux-test.sock\n'
+    elif [ "$2" = '-p' ] && [ "$5" = '#{session_attached}' ]; then
+      printf '1\n'
+    else
+      printf '0\n'
+    fi
+    exit 0
+    ;;
+  show-options)
+    printf 'off\n'
+    exit 0
+    ;;
+  set-option|set-hook|attach-session|kill-session|run-shell|resize-pane)
+    exit 0
+    ;;
+esac
+exit 0
+`,
+      );
+
+      const baseEnv = {
+        ...env,
+        OMX_RUNS_DIR: runs,
+        OMX_LAUNCH_POLICY: 'direct',
+        TMUX: '',
+        TMUX_PANE: '',
+      };
+      const first = runOmx(wd, ['--madmax', '--tmux'], baseEnv);
+      if (shouldSkipForSpawnPermissions(first.error)) return;
+      assert.equal(first.status, 0, first.error || first.stderr || first.stdout);
+
+      const second = runOmx(wd, ['--madmax', '--tmux'], baseEnv);
+      if (shouldSkipForSpawnPermissions(second.error)) return;
+      assert.equal(second.status, 0, second.error || second.stderr || second.stdout);
+      assert.match(
+        second.stderr,
+        /madmax detached launch already active for this context; attaching .* instead of starting a duplicate/,
+      );
+
+      const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
+      assert.equal((tmuxLog.match(/tmux:new-session/g) || []).length, 1);
+      assert.equal((tmuxLog.match(/tmux:has-session/g) || []).length, 1);
+      assert.equal((tmuxLog.match(/tmux:attach-session/g) || []).length, 2);
+      const firstRegistryEntry = JSON.parse(
+        (await readFile(join(runs, 'registry.jsonl'), 'utf-8')).trim().split('\n')[0],
+      );
+      const activeRecords = await readFile(
+        join(runs, 'active-detached', `${firstRegistryEntry.detached_launch_context}.json`),
+        'utf-8',
+      );
+      assert.match(activeRecords, /"tmux_session_name"/);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('allows distinct madmax detached launch contexts to create separate sessions', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-launch-madmax-distinct-'));
+    try {
+      const runs = join(wd, 'runs');
+      const { env, tmuxLogPath } = await createLaunchFixture(
+        wd,
+        (logPath) => `#!/bin/sh
+printf 'tmux:%s\n' "$*" >> "${logPath}"
+case "$1" in
+  -V) printf 'tmux 3.4\n'; exit 0 ;;
+  has-session) exit 1 ;;
+  new-session) printf 'leader-pane\n'; exit 0 ;;
+  split-window) printf 'hud-pane\n'; exit 0 ;;
+  display-message) if [ "$2" = '-p' ] && [ "$3" = '#{socket_path}' ]; then printf '/tmp/tmux-test.sock\n'; else printf '0\n'; fi; exit 0 ;;
+  show-options) printf 'off\n'; exit 0 ;;
+  set-option|set-hook|attach-session|kill-session|run-shell|resize-pane) exit 0 ;;
+esac
+exit 0
+`,
+      );
+      const baseEnv = {
+        ...env,
+        OMX_RUNS_DIR: runs,
+        OMX_LAUNCH_POLICY: 'direct',
+        TMUX: '',
+        TMUX_PANE: '',
+      };
+      const first = runOmx(wd, ['--madmax', '--tmux'], baseEnv);
+      const second = runOmx(wd, ['--madmax', '--xhigh', '--tmux'], baseEnv);
+      if (shouldSkipForSpawnPermissions(first.error) || shouldSkipForSpawnPermissions(second.error)) return;
+      assert.equal(first.status, 0, first.error || first.stderr || first.stdout);
+      assert.equal(second.status, 0, second.error || second.stderr || second.stdout);
+      const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
+      assert.equal((tmuxLog.match(/tmux:new-session/g) || []).length, 2);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
   it('launches --madmax through explicitly requested detached tmux so HUD bootstrap can run', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-launch-tmux-'));
     try {
