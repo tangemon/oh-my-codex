@@ -285,7 +285,7 @@ describe("codex native hook config", () => {
       matcher?: string;
       hooks?: Array<Record<string, unknown>>;
     };
-    assert.equal(preToolUse.matcher, "Bash");
+    assert.equal(preToolUse.matcher, undefined);
     assert.match(
       String(preToolUse.hooks?.[0]?.command || ""),
       /codex-native-hook\.js"?$/,
@@ -3884,6 +3884,183 @@ exit 0
 
       assert.equal(result.omxEventName, "pre-tool-use");
       assert.equal(result.outputJson, null);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks implementation file edits while deep-interview remains active after a clarified answer", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-pretool-deep-interview-edit-block-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const sessionDir = join(stateDir, "sessions", "sess-di-edit-block");
+      await mkdir(sessionDir, { recursive: true });
+      await writeJson(join(stateDir, "session.json"), { session_id: "sess-di-edit-block", cwd });
+      await writeJson(join(sessionDir, "skill-active-state.json"), {
+        version: 1,
+        active: true,
+        skill: "deep-interview",
+        phase: "planning",
+        session_id: "sess-di-edit-block",
+        thread_id: "thread-di-edit-block",
+        active_skills: [{ skill: "deep-interview", phase: "planning", active: true, session_id: "sess-di-edit-block", thread_id: "thread-di-edit-block" }],
+      });
+      await writeJson(join(sessionDir, "deep-interview-state.json"), {
+        active: true,
+        mode: "deep-interview",
+        current_phase: "intent-first",
+        session_id: "sess-di-edit-block",
+        thread_id: "thread-di-edit-block",
+        rounds: [{ answer: "Implement by editing src/hooks/keyword-detector.ts and add tests." }],
+      });
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: "sess-di-edit-block",
+          thread_id: "thread-di-edit-block",
+          tool_name: "Edit",
+          tool_use_id: "tool-di-edit-block",
+          tool_input: { file_path: "src/hooks/keyword-detector.ts", old_string: "a", new_string: "b" },
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "pre-tool-use");
+      assert.equal((result.outputJson as { decision?: string } | null)?.decision, "block");
+      assert.match(String((result.outputJson as { reason?: string } | null)?.reason ?? ""), /Deep-interview is active/);
+      assert.match(JSON.stringify(result.outputJson), /requirements\/spec mode/);
+      assert.match(JSON.stringify(result.outputJson), /\$ralplan/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("allows deep-interview artifact and state writes while blocking implementation Bash writes", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-pretool-deep-interview-artifact-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const sessionDir = join(stateDir, "sessions", "sess-di-artifact");
+      await mkdir(sessionDir, { recursive: true });
+      await writeJson(join(stateDir, "session.json"), { session_id: "sess-di-artifact", cwd });
+      await writeJson(join(sessionDir, "skill-active-state.json"), {
+        version: 1,
+        active: true,
+        skill: "deep-interview",
+        phase: "planning",
+        session_id: "sess-di-artifact",
+        active_skills: [{ skill: "deep-interview", phase: "planning", active: true, session_id: "sess-di-artifact" }],
+      });
+      await writeJson(join(sessionDir, "deep-interview-state.json"), {
+        active: true,
+        mode: "deep-interview",
+        current_phase: "intent-first",
+        session_id: "sess-di-artifact",
+      });
+
+      const allowedWrite = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: "sess-di-artifact",
+          tool_name: "Write",
+          tool_use_id: "tool-di-spec-write",
+          tool_input: { file_path: ".omx/specs/deep-interview-demo.md", content: "# Spec" },
+        },
+        { cwd },
+      );
+      assert.equal(allowedWrite.outputJson, null);
+
+      const allowedBash = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: "sess-di-artifact",
+          tool_name: "Bash",
+          tool_use_id: "tool-di-context-bash",
+          tool_input: { command: "cat > .omx/context/demo.md <<'EOF'\n# Context\nEOF" },
+        },
+        { cwd },
+      );
+      assert.equal(allowedBash.outputJson, null);
+
+      const allowedAppendBash = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: "sess-di-artifact",
+          tool_name: "Bash",
+          tool_use_id: "tool-di-context-append-bash",
+          tool_input: { command: "echo more context >> .omx/context/demo.md" },
+        },
+        { cwd },
+      );
+      assert.equal(allowedAppendBash.outputJson, null);
+
+      const blockedBash = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: "sess-di-artifact",
+          tool_name: "Bash",
+          tool_use_id: "tool-di-src-bash",
+          tool_input: { command: "cat > src/implementation.ts <<'EOF'\nexport const x = 1;\nEOF" },
+        },
+        { cwd },
+      );
+      assert.equal((blockedBash.outputJson as { decision?: string } | null)?.decision, "block");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("allows implementation tools after an explicit deep-interview handoff deactivates the mode", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-pretool-deep-interview-handoff-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const sessionDir = join(stateDir, "sessions", "sess-di-handoff");
+      await mkdir(sessionDir, { recursive: true });
+      await writeJson(join(sessionDir, "skill-active-state.json"), {
+        version: 1,
+        active: true,
+        skill: "deep-interview",
+        phase: "planning",
+        session_id: "sess-di-handoff",
+        active_skills: [{ skill: "deep-interview", phase: "planning", active: true, session_id: "sess-di-handoff" }],
+      });
+      await writeJson(join(sessionDir, "deep-interview-state.json"), {
+        active: true,
+        mode: "deep-interview",
+        current_phase: "intent-first",
+        session_id: "sess-di-handoff",
+      });
+
+      await dispatchCodexNativeHook(
+        {
+          hook_event_name: "UserPromptSubmit",
+          cwd,
+          session_id: "sess-di-handoff",
+          prompt: "$ralph implement the clarified spec in src/implementation.ts",
+        },
+        { cwd },
+      );
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: "sess-di-handoff",
+          tool_name: "Edit",
+          tool_use_id: "tool-di-post-handoff-edit",
+          tool_input: { file_path: "src/implementation.ts", old_string: "a", new_string: "b" },
+        },
+        { cwd },
+      );
+
+      assert.equal(result.outputJson, null);
+      const completed = JSON.parse(await readFile(join(sessionDir, "deep-interview-state.json"), "utf-8")) as { active?: boolean };
+      assert.equal(completed.active, false);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

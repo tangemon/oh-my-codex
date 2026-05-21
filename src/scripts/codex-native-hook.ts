@@ -5,6 +5,7 @@ import { extname, join, relative, resolve } from "path";
 import { pathToFileURL } from "url";
 import { readModeState, readModeStateForActiveDecision, readModeStateForSession, updateModeState } from "../modes/base.js";
 import {
+  SKILL_ACTIVE_STATE_FILE,
   extractSessionIdFromInitializedStatePath,
   getSkillActiveStatePathsForStateDir,
   listActiveSkills,
@@ -2272,6 +2273,151 @@ async function readStopSessionPinnedState(
   return readJsonIfExists(statePath);
 }
 
+const DEEP_INTERVIEW_ALLOWED_WRITE_PREFIXES = [
+  ".omx/context",
+  ".omx/interviews",
+  ".omx/specs",
+  ".omx/state",
+] as const;
+
+const DEEP_INTERVIEW_IMPLEMENTATION_TOOL_NAMES = new Set([
+  "Write",
+  "Edit",
+  "MultiEdit",
+  "apply_patch",
+  "ApplyPatch",
+]);
+
+function isActiveDeepInterviewPhase(state: Record<string, unknown> | null): boolean {
+  if (!state || state.active !== true) return false;
+  const mode = safeString(state.mode).trim();
+  if (mode && mode !== "deep-interview") return false;
+  const phase = safeString(state.current_phase ?? state.currentPhase).trim().toLowerCase();
+  if (phase && (TERMINAL_MODE_PHASES.has(phase) || phase === "completing")) return false;
+  return true;
+}
+
+function isAllowedDeepInterviewArtifactPath(cwd: string, rawPath: string): boolean {
+  const trimmed = rawPath.trim().replace(/^['"]|['"]$/g, "");
+  if (!trimmed || trimmed.includes("\0")) return false;
+  let relativePath: string;
+  try {
+    const absolute = resolve(cwd, trimmed);
+    relativePath = relative(cwd, absolute).replace(/\\/g, "/");
+  } catch {
+    return false;
+  }
+  if (!relativePath || relativePath.startsWith("..") || relativePath.startsWith("/")) return false;
+  return DEEP_INTERVIEW_ALLOWED_WRITE_PREFIXES.some((prefix) => (
+    relativePath === prefix || relativePath.startsWith(`${prefix}/`)
+  ));
+}
+
+function readPreToolUseCommand(payload: CodexHookPayload): string {
+  const toolInput = safeObject(payload.tool_input);
+  return safeString(toolInput.command).trim();
+}
+
+function readPreToolUsePathCandidates(payload: CodexHookPayload): string[] {
+  const input = safeObject(payload.tool_input);
+  const candidates = [
+    input.file_path,
+    input.filePath,
+    input.path,
+    input.target_path,
+    input.targetPath,
+  ];
+  return candidates.map((candidate) => safeString(candidate).trim()).filter(Boolean);
+}
+
+function commandHasDeepInterviewWriteIntent(command: string): boolean {
+  return /\bapply_patch\b/.test(command)
+    || /(?:^|[;&|]\s*)(?:cat|printf|echo)\b[\s\S]{0,240}>\s*[^\s&|;]+/.test(command)
+    || /\btee\s+(?:-a\s+)?[^\s&|;]+/.test(command)
+    || /\bsed\s+(?:[^\n;&|]*\s)?-i(?:\b|['"])/.test(command)
+    || /\b(?:python3?|node|perl|ruby)\b[\s\S]{0,260}\b(?:writeFileSync|writeFile|write_text|open\([^)]*["']w|File\.write|Path\()/.test(command)
+    || /\b(?:git\s+(?:checkout|switch|restore|reset|apply|am|merge|rebase)|npm\s+(?:install|i|ci)|pnpm\s+(?:install|i)|yarn\s+(?:install|add))\b/.test(command);
+}
+
+function extractDeepInterviewCommandWriteTargets(command: string): string[] {
+  const targets: string[] = [];
+  for (const match of command.matchAll(/(?:^|[^>])>{1,2}\s*(["']?)([^\s&|;<>]+)\1/g)) {
+    const candidate = safeString(match[2]).trim();
+    if (candidate) targets.push(candidate);
+  }
+  for (const match of command.matchAll(/\btee\s+(?:-a\s+)?(["']?)([^\s&|;<>]+)\1/g)) {
+    const candidate = safeString(match[2]).trim();
+    if (candidate) targets.push(candidate);
+  }
+  return targets;
+}
+
+function isAllowedDeepInterviewBashWrite(cwd: string, command: string): boolean {
+  if (!commandHasDeepInterviewWriteIntent(command)) return true;
+  if (/\bomx\s+(?:state\s+(?:write|read|clear)|question)\b/.test(command)) return true;
+  const targets = extractDeepInterviewCommandWriteTargets(command);
+  return targets.length > 0 && targets.every((target) => isAllowedDeepInterviewArtifactPath(cwd, target));
+}
+
+async function readActiveDeepInterviewStateForPreToolUse(
+  cwd: string,
+  stateDir: string,
+  sessionId: string,
+  threadId: string,
+): Promise<Record<string, unknown> | null> {
+  const modeState = sessionId
+    ? await readStopSessionPinnedState("deep-interview-state.json", cwd, sessionId, stateDir)
+    : await readJsonIfExists(join(stateDir, "deep-interview-state.json"));
+  if (!isActiveDeepInterviewPhase(modeState) || !modeState) return null;
+  if (!modeStateMatchesSkillStopContext(modeState, cwd, sessionId)) return null;
+
+  const canonicalState = sessionId
+    ? await readVisibleSkillActiveStateForStateDir(stateDir, sessionId)
+    : await readSkillActiveState(join(stateDir, SKILL_ACTIVE_STATE_FILE));
+  if (!canonicalState) return modeState;
+  const hasActiveDeepInterviewSkill = listActiveSkills(canonicalState).some((entry) => (
+    entry.skill === "deep-interview"
+    && matchesSkillStopContext(entry, canonicalState, sessionId, threadId)
+  ));
+  return hasActiveDeepInterviewSkill ? modeState : null;
+}
+
+async function buildDeepInterviewPreToolUseBoundaryOutput(
+  payload: CodexHookPayload,
+  cwd: string,
+  stateDir: string,
+): Promise<Record<string, unknown> | null> {
+  const sessionId = readPayloadSessionId(payload);
+  const threadId = readPayloadThreadId(payload);
+  const activeState = await readActiveDeepInterviewStateForPreToolUse(cwd, stateDir, sessionId, threadId);
+  if (!activeState) return null;
+
+  const toolName = safeString(payload.tool_name).trim();
+  const command = readPreToolUseCommand(payload);
+  const pathCandidates = readPreToolUsePathCandidates(payload);
+  let blocked = false;
+
+  if (toolName === "Bash") {
+    blocked = !isAllowedDeepInterviewBashWrite(cwd, command);
+  } else if (DEEP_INTERVIEW_IMPLEMENTATION_TOOL_NAMES.has(toolName)) {
+    blocked = pathCandidates.length === 0
+      || !pathCandidates.every((candidate) => isAllowedDeepInterviewArtifactPath(cwd, candidate));
+  }
+
+  if (!blocked) return null;
+
+  const phase = formatPhase(activeState.current_phase ?? activeState.currentPhase, "planning");
+  return {
+    decision: "block",
+    reason: `Deep-interview is active (phase: ${phase}); implementation/write tools are blocked until an explicit handoff workflow is activated.`,
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      additionalContext:
+        "Deep-interview is requirements/spec mode. Treat detailed user answers as interview/spec material, not implicit implementation authorization. You may write only deep-interview artifacts under `.omx/context/`, `.omx/interviews/`, `.omx/specs/`, or required `.omx/state/` files. To implement, first ask for or process an explicit transition such as `$ralplan`, `$autopilot`, `$ralph`, `$team`, or `$ultragoal`.",
+    },
+  };
+}
+
 function matchesSkillStopContext(
   entry: { session_id?: string; thread_id?: string },
   state: { session_id?: string; thread_id?: string },
@@ -3710,7 +3856,8 @@ export async function dispatchCodexNativeHook(
       };
     }
   } else if (hookEventName === "PreToolUse") {
-    outputJson = buildNativePreToolUseOutput(payload);
+    outputJson = await buildDeepInterviewPreToolUseBoundaryOutput(payload, cwd, stateDir)
+      ?? buildNativePreToolUseOutput(payload);
   } else if (hookEventName === "PostToolUse") {
     if (detectMcpTransportFailure(payload)) {
       await markTeamTransportFailure(cwd, payload);

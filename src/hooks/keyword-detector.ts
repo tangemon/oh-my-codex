@@ -594,12 +594,12 @@ function parseExplicitSkillInvocations(text: string): ExplicitSkillParseResult {
 
 function hasIntentContextForKeyword(text: string, keyword: string): boolean {
   const k = keyword.toLowerCase();
-  if (
-    (k === 'deep interview' || k === 'interview')
-    && DEEP_INTERVIEW_MANAGEMENT_MENTION_PATTERN.test(text)
-    && !DEEP_INTERVIEW_ACTIVATION_PATTERNS.some((pattern) => pattern.test(text))
-  ) {
-    return false;
+  if (k === 'deep interview' || k === 'interview') {
+    if (DEEP_INTERVIEW_MANAGEMENT_MENTION_PATTERN.test(text)
+      && !DEEP_INTERVIEW_ACTIVATION_PATTERNS.some((pattern) => pattern.test(text))) {
+      return false;
+    }
+    return DEEP_INTERVIEW_ACTIVATION_PATTERNS.some((pattern) => pattern.test(text));
   }
   if (!KEYWORDS_REQUIRING_INTENT.has(k)) return true;
   const patterns = KEYWORD_INTENT_PATTERNS[k as IntentKeyword];

@@ -251,6 +251,12 @@ describe('keyword detector team compatibility', () => {
     assert.equal(detectPrimaryKeyword('remove the stale deep interview lock from .omx/state'), null);
   });
 
+  it('does not trigger deep-interview from casual discussion mentions', () => {
+    assert.equal(detectPrimaryKeyword('the deep interview report is useful context for the next plan'), null);
+    assert.equal(detectPrimaryKeyword('we already did a deep interview and should not reactivate it'), null);
+    assert.equal(detectPrimaryKeyword('this interview transcript says implementation is ready'), null);
+  });
+
   it('maps "gather requirements" to deep-interview skill', () => {
     const match = detectPrimaryKeyword('let us gather requirements first');
 

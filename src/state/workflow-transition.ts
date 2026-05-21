@@ -23,7 +23,11 @@ const ALLOWED_OVERLAP_PAIRS = new Set([
 
 const AUTO_COMPLETE_TRANSITIONS = new Set([
   'deep-interview->ralplan',
+  'deep-interview->autopilot',
   'deep-interview->autoresearch',
+  'deep-interview->ralph',
+  'deep-interview->team',
+  'deep-interview->ultrawork',
   'ralplan->team',
   'ralplan->ralph',
   'ralplan->autopilot',

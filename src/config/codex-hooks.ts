@@ -230,9 +230,7 @@ export function buildManagedCodexHooksConfig(
         }),
       ],
       PreToolUse: [
-        buildCommandHook(command, {
-          matcher: "Bash",
-        }),
+        buildCommandHook(command),
       ],
       PostToolUse: [
         buildCommandHook(command),
