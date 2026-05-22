@@ -198,6 +198,20 @@ describe('prometheus-strict clean-room contract', () => {
     assert.match(metis, /3\.\s*\*\*Run\s*`<research_fan_out>`\*\*/, 'metis execution_loop must invoke research_fan_out as step 3 (after spec_prefill, before question generation)');
   });
 
+  it('researcher subagent referenced by Metis fan-out absorbs OMO librarian-shape capability', () => {
+    const researcher = readRepoFile(join(repoRoot, 'prompts', 'researcher.md'));
+    const metis = readRepoFile(join(repoRoot, 'prompts', 'prometheus-strict-metis.md'));
+
+    assert.match(researcher, /<repo_research>[\s\S]+<\/repo_research>/, 'researcher must declare a <repo_research> block to back metis cross-repo OSS lookups');
+    assert.match(researcher, /gh search code/i, 'researcher must enumerate gh search code for cross-repo OSS discovery');
+    assert.match(researcher, /raw\.githubusercontent\.com|gh api repos\/<org>\/<repo>/i, 'researcher must allow pinned-SHA OSS file fetches');
+    assert.match(researcher, /Context7 MCP/i, 'researcher must reference Context7 MCP with a graceful web fallback');
+    assert.match(researcher, /org\/repo@sha:path/i, 'researcher must specify the org/repo@sha:path:line citation format');
+    assert.match(researcher, /OSS Reference Implementations/, 'researcher output_contract must include the OSS Reference Implementations section');
+
+    assert.match(metis, /org\/repo@sha:file:line/, 'metis research_fan_out must declare the org/repo@sha:file:line citation form, coupling researcher OSS contract to prometheus fan-out');
+  });
+
   it('enforces the Metis intent-classification, spec-prefill, self-review, and stale-rule cleanup contract', () => {
     const metis = readRepoFile(join(repoRoot, 'prompts', 'prometheus-strict-metis.md'));
 
