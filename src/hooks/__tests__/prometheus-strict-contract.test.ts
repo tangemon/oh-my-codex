@@ -73,6 +73,7 @@ describe('prometheus-strict clean-room contract', () => {
       'Do_Not_Use_When',
       'Why_This_Exists',
       'Execution_Policy',
+      'Turn_Termination_Rules',
       'Steps',
       'Tool_Usage',
       'Final_Checklist',
@@ -256,6 +257,32 @@ describe('prometheus-strict clean-room contract', () => {
     assert.match(metis, /(?:explicit[\s\S]{0,20}(?:new feature|from scratch|greenfield)|name a new module|require[\s\S]{0,40}explicit)/i, 'metis <intent_classification> must require explicit greenfield keywords before classifying as build-from-scratch');
   });
 
+
+  it('enforces checklist clearance and turn termination quality gates', () => {
+    const skill = readRepoFile(skillPath);
+    const metis = readRepoFile(join(repoRoot, 'prompts', 'prometheus-strict-metis.md'));
+    const momus = readRepoFile(join(repoRoot, 'prompts', 'prometheus-strict-momus.md'));
+    const oracle = readRepoFile(join(repoRoot, 'prompts', 'prometheus-strict-oracle.md'));
+
+    assert.match(skill, /<Turn_Termination_Rules>[\s\S]+<\/Turn_Termination_Rules>/, 'skill must include turn termination block');
+    assert.match(skill, /EXACTLY ONE of/i, 'termination must choose exactly one path');
+    assert.match(skill, /\(a\)[\s\S]{0,120}omx question[\s\S]{0,80}batch/i, 'option a must name omx question batch');
+    assert.match(skill, /\(b\)[\s\S]{0,120}explicit handoff/i, 'option b must name explicit handoff');
+    assert.match(skill, /\(c\)[\s\S]{0,120}stop-blocker/i, 'option c must name stop-blocker');
+    assert.doesNotMatch(skill, /answered_high_leverage_question_count\s*>=\s*3/i, 'count rule removed from skill');
+    assert.doesNotMatch(metis, /answered_high_leverage_question_count\s*>=\s*3/i, 'count rule removed from metis');
+    assert.match(metis, /6[- ]item checklist|six[- ]item checklist/i, 'metis must name 6-item checklist');
+    assert.match(metis, /objective[\s\S]{0,300}scope IN\+OUT[\s\S]{0,300}acceptance[\s\S]{0,300}test strategy[\s\S]{0,300}handoff target[\s\S]{0,300}no outstanding CRITICAL/i, 'metis must list checklist items in order');
+    assert.match(metis, /ALL[\s\S]{0,80}YES[\s\S]{0,120}ANY[\s\S]{0,80}NO[\s\S]{0,120}(?:ask|question)/i, 'metis must lock YES/NO transition');
+    assert.match(metis, /Plan-A[\s\S]{0,200}Plan-B[\s\S]{0,240}(?:identical|same)[\s\S]{0,120}(?:DROP|absorb)/i, 'metis must drop identical Plan-A Plan-B');
+    assert.match(metis, /WHEN IN DOUBT|DO NOT ask unless[\s\S]{0,120}structurally different plans/i, 'metis must default to absorb');
+    assert.match(metis, /MUST[\s\S]{0,80}absorbed[\s\S]{0,80}(?:exceed|>=|≥)/i, 'metis absorbed ratio must be MUST');
+    assert.match(`${skill}
+${metis}`, /USER_ANSWERED[\s\S]+ABSORBED_WITH_CITATION[\s\S]+INFERRED_FROM_SPEC/, 'tri-state checklist YES must be named');
+    assert.match(`${momus}
+${oracle}`, /Default-absorb prior[\s\S]+Plan-A-vs-Plan-B[\s\S]+scope boundary[\s\S]+acceptance criterion[\s\S]+rollback contract[\s\S]+lane assignment[\s\S]+handoff target/i, 'momus and oracle must share default absorb prior');
+  });
+
   it('imports the OMO Prometheus judge-absorption pattern: gap triage, silent absorption, and single-decision test-strategy', () => {
     const metis = readRepoFile(join(repoRoot, 'prompts', 'prometheus-strict-metis.md'));
 
@@ -295,7 +322,7 @@ describe('prometheus-strict clean-room contract', () => {
 
     assert.match(metis, /(?:exit|terminate|abort|stop)[\s\S]{0,200}(?:interview|loop|round)/i, 'metis hostility detection must exit the interview loop, not continue asking');
     assert.match(metis, /(?:escalate|hand off|return control|surface the [hH]ostility)[\s\S]{0,300}(?:user|caller|Oracle|carry[-\s]?forward)/i, 'metis hostility detection must escalate the unresolved decision back to the user or carry it forward, not silently swallow it');
-    assert.match(metis, /(?:do not increment|must not increment|does not count|invalidates? the (?:round|answer))/i, 'metis hostility detection must specify that hostile / non-answer responses do NOT count toward answered_high_leverage_question_count');
+    assert.match(metis, /(?:do not increment|must not increment|does not count|invalidates? the (?:round|answer)|do NOT advance[\s\S]{0,80}checklist item)/i, 'metis hostile responses must not advance checklist YES');
 
     assert.match(skill, /(?:hostil|non[\s-]?answer|user (?:refus|reject|abort))[\s\S]{0,300}(?:exit|escalate|terminate|invalidate)/i, 'skill Rule-Based Clearance section must reflect the hostility exit path so the user sees the rule at the workflow level');
   });
@@ -325,16 +352,16 @@ describe('prometheus-strict clean-room contract', () => {
     assert.match(metis, /5 rounds|round[s]?[\s\S]{0,20}cap|cap[\s\S]{0,40}5/i, 'metis prompt must cap rounds at 5');
 
     // Gate 2: Rule-based clearance is deterministic, not subjective
-    const clearanceRule = /unresolved[_\s-]?blocker[_\s-]?count\s*==\s*0[\s\S]{0,200}answered[_\s-]?high[_\s-]?leverage[_\s-]?question[_\s-]?count\s*>=\s*3/i;
+    const clearanceRule = /6[- ]item checklist[\s\S]{0,800}objective[\s\S]{0,800}scope IN\+OUT[\s\S]{0,800}acceptance[\s\S]{0,800}test strategy[\s\S]{0,800}handoff target[\s\S]{0,800}no outstanding CRITICAL/i;
     assert.match(
       skill,
       clearanceRule,
-      'skill must declare the rule-based clearance gate (unresolved_blocker_count == 0 AND answered_high_leverage_question_count >= 3)',
+      'skill must declare the 6-item checklist clearance gate',
     );
     assert.match(
       metis,
       clearanceRule,
-      'metis prompt must declare the rule-based clearance gate',
+      'metis prompt must declare the 6-item checklist gate',
     );
 
     // Gate 3: Post-plan Metis gap check before handoff
@@ -411,7 +438,7 @@ describe('prometheus-strict clean-room contract', () => {
     assert.match(oracle, /cap[\s\S]{0,40}3|cycles? at[\s\S]{0,10}3/i, 'oracle prompt must cap Pass 1 ↔ Pass 2 cycles at 3');
 
     // Gate 6: Final_Checklist reflects the strengthened gates
-    assert.match(skill, /rule-based clearance/i, 'Final_Checklist must reference rule-based clearance');
+    assert.match(skill, /checklist clearance/i, 'Final_Checklist must reference checklist clearance');
     assert.match(skill, /Oracle Pass 2 self-verification/i, 'Final_Checklist must reference Oracle Pass 2 self-verification');
     assert.match(skill, /Post-plan Metis gap check/i, 'Final_Checklist must reference the post-plan Metis gap check');
   });
