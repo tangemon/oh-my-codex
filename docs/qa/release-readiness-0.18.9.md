@@ -95,14 +95,14 @@ Commands were run from `/Users/bellman/Documents/Workspace/oh-my-codex`; release
 - [x] Static release review subagent gate, final pass — APPROVE/CLEAR, subagent `019e8cb9-cff6-74e1-bc4c-1de10f7ef2b2`.
 - [x] Mandatory UltraQA release-flow adversarial checks — PASS/CLEAN, `.omx/release-0.18.9/ultraqa-report.md`; dynamic probes in `.omx/release-0.18.9/logs/ultraqa-*.log`.
 - [x] `WORKER_COUNT=5 bash src/scripts/demo-team-e2e.sh` live demo — ENV-BLOCKED/CLEANED in the active Autopilot tmux leader: pre-commit run correctly failed closed on `leader_workspace_dirty_for_worktrees` (`.omx/release-0.18.9/logs/demo-team-e2e.log`); post-commit attached/isolated attempts reached worker startup but created live worker panes that interpreted the demo task as implementation work, then were force-cleaned with no tracked root changes (`.omx/release-0.18.9/logs/demo-team-e2e-after-commit.log`, `.omx/release-0.18.9/logs/demo-team-e2e-isolated.log`). Substitute release evidence is the passing compiled team runtime/identity gate plus team API coverage in the full suites: `.omx/release-0.18.9/logs/test-team-worker-runtime-identity-compiled.log`, `.omx/release-0.18.9/logs/test-ci-compiled.log`, and `.omx/release-0.18.9/logs/npm-test-clean.log`.
-- [ ] Local annotated tag validation before push.
-- [ ] Generated release body check for `v0.18.8...v0.18.9`, including `## Contributors`, correct Full Changelog, major compare-range coverage, and contributor review against merged PR authors.
+- [x] Local annotated tag validation before push — PASS for `v0.18.9` on release-prep commit; local tag recreated after evidence-only readiness updates before remote tag push.
+- [x] Generated release body check for `v0.18.8...v0.18.9` — PASS for `## Contributors`, correct Full Changelog, major compare-range coverage, and manual contributor review against merged PR authors. Local-only tag generation falls back to git shortlog because GitHub compare cannot resolve the unpushed tag (`404`); post-tag release workflow must regenerate from GitHub compare metadata and verify contributor handles before final release proof.
 - [ ] Native release asset manifest verification / post-tag workflow evidence.
 
 ## CI / PR evidence
 
-- [ ] Release-prep PR/commit CI green.
-- [ ] Main promotion CI green.
+- [x] Release-prep `dev` CI green — GitHub Actions run `26875635807`, completed/success for `ffd02c65`.
+- [x] Main promotion CI green — GitHub Actions run `26876121950`, completed/success for `ffd02c65`.
 - [ ] Tag-triggered release workflow green, including native asset verification, smoke-verify-native, packed install smoke, and npm publish.
 - [ ] GitHub release proof: `gh release view v0.18.9` non-draft/non-prerelease with `native-release-manifest.json`.
 - [ ] npm proof: `npm view oh-my-codex version dist-tags --json` returns `0.18.9` / `latest: 0.18.9`.
@@ -111,4 +111,4 @@ Commands were run from `/Users/bellman/Documents/Workspace/oh-my-codex`; release
 
 ## Current readiness verdict
 
-Local implementation, packaging, runtime smoke, code-review, UltraQA, and team-runtime substitute gates are passing. Remaining blockers before tag/publish are: release-body generation/validation after local tag creation, remote CI gates, tag-triggered release workflow, GitHub release/native asset proof, npm proof, and final `dev`/`main` sync evidence.
+Local implementation, packaging, runtime smoke, code-review, UltraQA, team-runtime substitute, local release-body, `dev` CI, and `main` CI gates are passing. Remaining blockers before completion are: rerun branch CI after this evidence-only readiness update, tag-triggered release workflow, GitHub release/native asset proof, npm proof, and final `dev`/`main` sync evidence.
