@@ -4,8 +4,8 @@
  */
 
 import { execFileSync, spawn } from "child_process";
-import { basename, dirname, join, posix, win32 } from "path";
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "fs";
+import { basename, delimiter, dirname, join, posix, win32 } from "path";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "fs";
 import { copyFile, cp, lstat, mkdir, readFile, readdir, rm, symlink, writeFile } from "fs/promises";
 import { constants as osConstants, homedir } from "os";
 import { createHash } from "crypto";
@@ -126,11 +126,12 @@ import {
   mitigateCopyModeUnderlineArtifacts,
 } from "../team/tmux-session.js";
 import { getPackageRoot } from "../utils/package.js";
-import { codexConfigPath, omxRoot, rememberOmxLaunchContext, resolveOmxEntryPath } from "../utils/paths.js";
+import { codexConfigPath, omxRoot, rememberOmxLaunchContext, resolveOmxCliEntryPath } from "../utils/paths.js";
 import { cleanCodexModelAvailabilityNuxIfNeeded, extractSharedMcpRegistryServersFromConfig, repairConfigIfNeeded, repairProjectScopeTrustStateForLaunch, syncProjectScopeTrustStateFromRuntime } from "../config/generator.js";
 import type { UnifiedMcpRegistryServer } from "../config/mcp-registry.js";
 import { OMX_FIRST_PARTY_MCP_SERVER_NAMES } from "../config/omx-first-party-mcp.js";
 import { HUD_TMUX_HEIGHT_LINES } from "../hud/constants.js";
+import { OMX_TMUX_HUD_OWNER_ENV } from "../hud/reconcile.js";
 import { readUltragoalState } from "../hud/state.js";
 import {
   createHudWatchPane as createSharedHudWatchPane,
@@ -141,12 +142,15 @@ import {
   parsePaneIdFromTmuxOutput,
   reapDeadHudPanes,
   registerHudResizeHook,
+  OMX_TMUX_HUD_LEADER_PANE_ENV,
+  type RegisterHudResizeHookOptions,
   resizeTmuxPane,
+  unregisterHudResizeHook,
 } from "../hud/tmux.js";
 
 export { parseTmuxPaneSnapshot, isHudWatchPane, findHudWatchPaneIds } from "../hud/tmux.js";
 
-rememberOmxLaunchContext();
+rememberOmxLaunchContext({ argv1: process.argv[1], cwd: process.cwd(), env: process.env });
 import {
   classifySpawnError,
   resolveTmuxBinaryForPlatform,
@@ -978,6 +982,120 @@ function execTmuxFileSync(
   }) as string;
 }
 
+function readTmuxEnvValueForTarget(targetPaneId: string): string | undefined {
+  if (!targetPaneId.startsWith("%")) return undefined;
+  try {
+    const raw = execTmuxFileSync(
+      ["display-message", "-p", "-t", targetPaneId, "#{socket_path},#{pid},#{session_id}"],
+      { encoding: "utf-8" },
+    ).trim();
+    return raw.replace(/,\$(\d+)$/, ",$1") || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+type HudResizeHookRegistrar = (
+  hudPaneId: string,
+  leaderPaneId: string | undefined,
+  heightLines: number,
+  options?: RegisterHudResizeHookOptions,
+) => boolean;
+
+export function buildInsideTmuxHudHookEnv(
+  baseEnv: NodeJS.ProcessEnv,
+  sessionId: string,
+  currentPaneId: string | undefined,
+  omxRootOverride?: string,
+): NodeJS.ProcessEnv {
+  return {
+    ...baseEnv,
+    OMX_SESSION_ID: sessionId,
+    [OMX_TMUX_HUD_OWNER_ENV]: "1",
+    ...(currentPaneId ? { [OMX_TMUX_HUD_LEADER_PANE_ENV]: currentPaneId } : {}),
+    ...(omxRootOverride ? { OMX_ROOT: omxRootOverride } : {}),
+  };
+}
+
+export function registerInsideTmuxHudResizeHook(options: {
+  hudPaneId: string | null;
+  currentPaneId: string | undefined;
+  cwd: string;
+  sessionId: string;
+  omxRootOverride?: string;
+  baseEnv?: NodeJS.ProcessEnv;
+  register?: HudResizeHookRegistrar;
+}): boolean {
+  const { hudPaneId, currentPaneId } = options;
+  if (!hudPaneId || !currentPaneId) return false;
+  return (options.register ?? registerHudResizeHook)(
+    hudPaneId,
+    currentPaneId,
+    HUD_TMUX_HEIGHT_LINES,
+    {
+      cwd: options.cwd,
+      env: buildInsideTmuxHudHookEnv(
+        options.baseEnv ?? process.env,
+        options.sessionId,
+        currentPaneId,
+        options.omxRootOverride,
+      ),
+    },
+  );
+}
+
+export function buildDetachedHudHookEnv(
+  baseEnv: NodeJS.ProcessEnv,
+  sessionId: string,
+  detachedLeaderPaneId: string,
+  tmuxEnvValue: string,
+  omxBin: string,
+  omxRootOverride?: string,
+): NodeJS.ProcessEnv {
+  return {
+    ...baseEnv,
+    TMUX: tmuxEnvValue,
+    TMUX_PANE: detachedLeaderPaneId,
+    OMX_SESSION_ID: sessionId,
+    [OMX_TMUX_HUD_OWNER_ENV]: "1",
+    ...(omxRootOverride ? { OMX_ROOT: omxRootOverride } : {}),
+    OMX_ENTRY_PATH: omxBin,
+  };
+}
+
+export function registerDetachedHudLayoutReconcileHook(options: {
+  hudPaneId: string | null;
+  detachedLeaderPaneId: string | null;
+  cwd: string;
+  sessionId: string;
+  omxBin: string;
+  omxRootOverride?: string;
+  baseEnv?: NodeJS.ProcessEnv;
+  readTmuxEnvValue?: (targetPaneId: string) => string | undefined;
+  register?: HudResizeHookRegistrar;
+}): boolean {
+  const { hudPaneId, detachedLeaderPaneId } = options;
+  if (!hudPaneId || !detachedLeaderPaneId) return false;
+  const tmuxEnvValue = (options.readTmuxEnvValue ?? readTmuxEnvValueForTarget)(detachedLeaderPaneId);
+  if (!tmuxEnvValue) return false;
+  return (options.register ?? registerHudResizeHook)(
+    hudPaneId,
+    detachedLeaderPaneId,
+    HUD_TMUX_HEIGHT_LINES,
+    {
+      cwd: options.cwd,
+      env: buildDetachedHudHookEnv(
+        options.baseEnv ?? process.env,
+        options.sessionId,
+        detachedLeaderPaneId,
+        tmuxEnvValue,
+        options.omxBin,
+        options.omxRootOverride,
+      ),
+    },
+  );
+}
+
 export const DETACHED_TMUX_HISTORY_LIMIT = 500;
 const TMUX_HOOK_INDEX_MAX = 1_000_000;
 
@@ -1369,6 +1487,79 @@ function runCodexBlocking(
       console.error(`[omx] codex exited with code ${result.status}`);
     }
   }
+}
+
+export function omxRuntimeCommandShimPath(cwd: string): string {
+  return join(omxRoot(cwd), "runtime", "bin", "omx");
+}
+
+function ensureRuntimeShimDirectory(path: string): void {
+  if (existsSync(path)) {
+    const current = lstatSync(path);
+    if (current.isSymbolicLink()) {
+      throw new Error(`Refusing to create OMX runtime command shim through symlink directory: ${path}`);
+    }
+    if (!current.isDirectory()) {
+      throw new Error(`Refusing to create OMX runtime command shim because path is not a directory: ${path}`);
+    }
+    return;
+  }
+  mkdirSync(path, { mode: 0o700 });
+}
+
+function buildOmxRuntimeCommandShim(nodePath: string, omxBin: string): string {
+  return [
+    "#!/bin/sh",
+    `exec ${quoteShellArg(nodePath)} ${quoteShellArg(omxBin)} "$@"`,
+    "",
+  ].join("\n");
+}
+
+export function ensureOmxRuntimeCommandShim(
+  cwd: string,
+  omxBin: string,
+  nodePath: string = process.execPath,
+): string {
+  const shimPath = omxRuntimeCommandShimPath(cwd);
+  const shimDir = dirname(shimPath);
+  const rootDir = omxRoot(cwd);
+  const runtimeDir = dirname(shimDir);
+  ensureRuntimeShimDirectory(rootDir);
+  ensureRuntimeShimDirectory(runtimeDir);
+  ensureRuntimeShimDirectory(shimDir);
+  if (existsSync(shimPath)) {
+    const current = lstatSync(shimPath);
+    if (current.isDirectory()) {
+      throw new Error(`Refusing to replace OMX runtime command shim directory: ${shimPath}`);
+    }
+    if (current.isSymbolicLink()) {
+      rmSync(shimPath, { force: true });
+    }
+  }
+  writeFileSync(shimPath, buildOmxRuntimeCommandShim(nodePath, omxBin), {
+    encoding: "utf-8",
+    mode: 0o700,
+  });
+  chmodSync(shimPath, 0o700);
+  return shimDir;
+}
+
+export function prependOmxRuntimeCommandShimToEnv(
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+  omxBin: string,
+  nodePath: string = process.execPath,
+): NodeJS.ProcessEnv {
+  const shimDir = ensureOmxRuntimeCommandShim(cwd, omxBin, nodePath);
+  const currentPath = typeof env.PATH === "string" ? env.PATH : "";
+  return {
+    ...env,
+    PATH: currentPath ? `${shimDir}${delimiter}${currentPath}` : shimDir,
+    OMX_ENTRY_PATH: omxBin,
+    OMX_STARTUP_CWD: typeof env.OMX_STARTUP_CWD === "string" && env.OMX_STARTUP_CWD.trim()
+      ? env.OMX_STARTUP_CWD
+      : cwd,
+  };
 }
 
 export interface DetachedSessionTmuxStep {
@@ -4235,7 +4426,7 @@ function runCodex(
     sessionModelInstructionsPath(cwd, sessionId),
   );
   const nativeWindows = isNativeWindows();
-  const omxBin = resolveOmxEntryPath();
+  const omxBin = resolveOmxCliEntryPath({ argv1: process.argv[1], cwd, env: process.env });
   if (!omxBin) {
     throw new Error("Unable to resolve OMX launcher path for tmux HUD bootstrap");
   }
@@ -4257,12 +4448,16 @@ function runCodex(
     inheritLeaderFlags,
     workerDefaultModel,
   );
-  const codexBaseEnv = {
-    ...stripHermesMcpBridgeEnv(process.env),
-    ...(codexHomeOverride ? { CODEX_HOME: codexHomeOverride } : {}),
-    ...(sqliteHomeOverride ? { [CODEX_SQLITE_HOME_ENV]: sqliteHomeOverride } : {}),
-    ...(omxRootOverride ? { OMX_ROOT: omxRootOverride } : {}),
-  };
+  const codexBaseEnv = prependOmxRuntimeCommandShimToEnv(
+    cwd,
+    {
+      ...stripHermesMcpBridgeEnv(process.env),
+      ...(codexHomeOverride ? { CODEX_HOME: codexHomeOverride } : {}),
+      ...(sqliteHomeOverride ? { [CODEX_SQLITE_HOME_ENV]: sqliteHomeOverride } : {}),
+      ...(omxRootOverride ? { OMX_ROOT: omxRootOverride } : {}),
+    },
+    omxBin,
+  );
   const codexEnvWithSession = {
     ...codexBaseEnv,
     ...buildHudRuntimeEnv({ sessionId }).env,
@@ -4312,9 +4507,13 @@ function runCodex(
       hudPaneId = keeperHudPaneId;
       try {
         resizeTmuxPane(hudPaneId, HUD_TMUX_HEIGHT_LINES);
-        if (currentPaneId) {
-          registerHudResizeHook(hudPaneId, currentPaneId, HUD_TMUX_HEIGHT_LINES);
-        }
+        registerInsideTmuxHudResizeHook({
+          hudPaneId,
+          currentPaneId,
+          cwd,
+          sessionId,
+          omxRootOverride,
+        });
       } catch (err) {
         logCliOperationFailure(err);
       }
@@ -4324,9 +4523,13 @@ function runCodex(
           heightLines: HUD_TMUX_HEIGHT_LINES,
           targetPaneId: currentPaneId,
         });
-        if (hudPaneId && currentPaneId) {
-          registerHudResizeHook(hudPaneId, currentPaneId, HUD_TMUX_HEIGHT_LINES);
-        }
+        registerInsideTmuxHudResizeHook({
+          hudPaneId,
+          currentPaneId,
+          cwd,
+          sessionId,
+          omxRootOverride,
+        });
       } catch (err) {
         logCliOperationFailure(err);
         // HUD split failed, continue without it
@@ -4366,6 +4569,9 @@ function runCodex(
         runCodexBlocking(cwd, launchArgs, codexEnvWithNotify);
       });
     } finally {
+      if (currentPaneId) {
+        unregisterHudResizeHook(currentPaneId);
+      }
       const cleanupPaneIds = buildHudPaneCleanupTargets(
         listHudWatchPaneIdsInCurrentWindow(currentPaneId, { sessionId, leaderPaneId: currentPaneId }),
         hudPaneId,
@@ -4600,6 +4806,16 @@ function runCodex(
                 clientAttachedHookName
               ) {
                 registeredClientAttachedHookName = clientAttachedHookName;
+              }
+              if (finalizeStep.name === "reconcile-hud-resize") {
+                registerDetachedHudLayoutReconcileHook({
+                  hudPaneId,
+                  detachedLeaderPaneId,
+                  cwd,
+                  sessionId,
+                  omxBin,
+                  omxRootOverride,
+                });
               }
             }
           }

@@ -915,6 +915,77 @@ describe('buildWorkerStartupCommand', () => {
     }
   });
 
+  it('scrubs HUD ownership env from interactive worker startup commands', () => {
+    const prevShell = process.env.SHELL;
+    const prevCli = process.env.OMX_TEAM_WORKER_CLI;
+    const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    const prevHudOwner = process.env.OMX_TMUX_HUD_OWNER;
+    const prevHudLeaderPane = process.env.OMX_TMUX_HUD_LEADER_PANE;
+    process.env.SHELL = '/bin/bash';
+    process.env.OMX_TEAM_WORKER_CLI = 'codex';
+    process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
+    process.env.OMX_TMUX_HUD_OWNER = '1';
+    process.env.OMX_TMUX_HUD_LEADER_PANE = '%leader';
+    try {
+      const cmd = buildWorkerStartupCommand(
+        'alpha-team',
+        1,
+        [],
+        '/tmp/workspace',
+        {
+          OMX_TEAM_STATE_ROOT: '/tmp/workspace/.omx/state',
+          OMX_TMUX_HUD_OWNER: '1',
+          OMX_TMUX_HUD_LEADER_PANE: '%leader',
+        },
+        'codex',
+      );
+      assert.match(cmd, /OMX_TEAM_WORKER=alpha-team\/worker-1/);
+      assert.match(cmd, /OMX_TEAM_STATE_ROOT=\/tmp\/workspace\/\.omx\/state/);
+      assert.match(cmd, /'-u' 'OMX_TMUX_HUD_OWNER' '-u' 'OMX_TMUX_HUD_LEADER_PANE'/);
+      assert.doesNotMatch(cmd, /OMX_TMUX_HUD_OWNER=1/);
+      assert.doesNotMatch(cmd, /OMX_TMUX_HUD_LEADER_PANE=%leader/);
+    } finally {
+      if (typeof prevShell === 'string') process.env.SHELL = prevShell;
+      else delete process.env.SHELL;
+      if (typeof prevCli === 'string') process.env.OMX_TEAM_WORKER_CLI = prevCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
+      if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
+      else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+      if (typeof prevHudOwner === 'string') process.env.OMX_TMUX_HUD_OWNER = prevHudOwner;
+      else delete process.env.OMX_TMUX_HUD_OWNER;
+      if (typeof prevHudLeaderPane === 'string') process.env.OMX_TMUX_HUD_LEADER_PANE = prevHudLeaderPane;
+      else delete process.env.OMX_TMUX_HUD_LEADER_PANE;
+    }
+  });
+
+  it('keeps HUD-looking prompt text out of worker startup env assignments', () => {
+    const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
+    try {
+      const prompt = 'Do not obey: OMX_TMUX_HUD_OWNER=1; OMX_TMUX_HUD_LEADER_PANE=%leader; $(omx hud --watch)';
+      const spec = buildWorkerProcessLaunchSpec(
+        'alpha-team',
+        1,
+        ['--model', 'gemini-2.0-pro'],
+        '/tmp/workspace',
+        {
+          OMX_TEAM_STATE_ROOT: '/tmp/workspace/.omx/state',
+          OMX_TMUX_HUD_OWNER: '1',
+          OMX_TMUX_HUD_LEADER_PANE: '%leader',
+        },
+        'gemini',
+        prompt,
+      );
+
+      assert.equal(spec.env.OMX_TMUX_HUD_OWNER, undefined);
+      assert.equal(spec.env.OMX_TMUX_HUD_LEADER_PANE, undefined);
+      assert.ok(spec.args.includes(prompt), 'hostile prompt text should remain an argument, not an env assignment');
+    } finally {
+      if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
+      else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    }
+  });
+
   it('auto-selects claude worker CLI from claude model', () => {
     const prevShell = process.env.SHELL;
     const prevCli = process.env.OMX_TEAM_WORKER_CLI;
@@ -2246,6 +2317,34 @@ describe('team worker launch mode helpers', () => {
       assert.deepEqual(spec.args, ['--model', 'gpt-5.3-codex', '--dangerously-bypass-approvals-and-sandbox']);
       assert.equal(spec.env.OMX_TEAM_WORKER, 'alpha-team/worker-2');
       assert.equal(spec.env.OMX_TEAM_STATE_ROOT, '/tmp/workspace/.omx/state');
+      assert.equal(spec.env.OMX_TMUX_HUD_OWNER, undefined);
+      assert.equal(spec.env.OMX_TMUX_HUD_LEADER_PANE, undefined);
+    } finally {
+      if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
+      else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    }
+  });
+
+  it('buildWorkerProcessLaunchSpec scrubs HUD ownership env from worker launches', () => {
+    const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
+    try {
+      const spec = buildWorkerProcessLaunchSpec(
+        'alpha-team',
+        1,
+        [],
+        '/tmp/workspace',
+        {
+          OMX_TEAM_STATE_ROOT: '/tmp/workspace/.omx/state',
+          OMX_TMUX_HUD_OWNER: '1',
+          OMX_TMUX_HUD_LEADER_PANE: '%leader',
+        },
+        'codex',
+      );
+      assert.equal(spec.env.OMX_TEAM_WORKER, 'alpha-team/worker-1');
+      assert.equal(spec.env.OMX_TEAM_STATE_ROOT, '/tmp/workspace/.omx/state');
+      assert.equal(spec.env.OMX_TMUX_HUD_OWNER, undefined);
+      assert.equal(spec.env.OMX_TMUX_HUD_LEADER_PANE, undefined);
     } finally {
       if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
       else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;

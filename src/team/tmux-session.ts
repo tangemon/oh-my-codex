@@ -946,6 +946,13 @@ function readTmuxWorkerAmbientEnv(env: NodeJS.ProcessEnv = process.env): Record<
   return inherited;
 }
 
+export function scrubTeamWorkerHudOwnershipEnv<T extends Record<string, string | undefined>>(env: T): T {
+  const scrubbed = { ...env };
+  delete scrubbed[OMX_TMUX_HUD_OWNER_ENV];
+  delete scrubbed[OMX_TMUX_HUD_LEADER_PANE_ENV];
+  return scrubbed;
+}
+
 function hasConfigOverride(args: readonly string[], key: string): boolean {
   const prefix = `${key}=`;
   for (let index = 0; index < args.length; index += 1) {
@@ -1030,10 +1037,10 @@ export function buildWorkerStartupCommand(
     initialPrompt,
     workerRole,
   );
-  const startupEnv = {
+  const startupEnv = scrubTeamWorkerHudOwnershipEnv({
     ...readTmuxWorkerAmbientEnv(process.env),
     ...processSpec.env,
-  };
+  });
   const startupArgs = [...processSpec.args];
   if (processSpec.workerCli === 'codex') {
     appendTeamWorkerMcpDisableOverrides(startupArgs, { ...process.env, ...extraEnv });
@@ -1047,6 +1054,9 @@ export function buildWorkerStartupCommand(
     const pathBootstrap = leaderNodeDir
       ? `$env:PATH = ${quotePowerShellArg(`${leaderNodeDir};`)} + $env:PATH`
       : '';
+    const hudEnvUnset = [OMX_TMUX_HUD_OWNER_ENV, OMX_TMUX_HUD_LEADER_PANE_ENV]
+      .map((key) => `Remove-Item Env:${key} -ErrorAction SilentlyContinue`)
+      .join('; ');
     const envAssignments = Object.entries(startupEnv)
       .map(([key, value]) => `$env:${key} = ${quotePowerShellArg(value)}`)
       .join('; ');
@@ -1055,6 +1065,7 @@ export function buildWorkerStartupCommand(
       [
         "$ErrorActionPreference = 'Stop'",
         pathBootstrap,
+        hudEnvUnset,
         envAssignments,
         invocation,
       ].filter(Boolean).join('; '),
@@ -1078,8 +1089,9 @@ export function buildWorkerStartupCommand(
     : '';
   const inner = `${rcPrefix}${pathPrefix}${cliInvocation}`;
   const envParts = Object.entries(startupEnv).map(([key, value]) => `${key}=${value}`);
+  const unsetParts = ['-u', OMX_TMUX_HUD_OWNER_ENV, '-u', OMX_TMUX_HUD_LEADER_PANE_ENV];
 
-  return `env ${envParts.map(shellQuoteSingle).join(' ')} ${shellQuoteSingle(launchSpec.shell)} -c ${shellQuoteSingle(inner)}`;
+  return `env ${[...unsetParts, ...envParts].map(shellQuoteSingle).join(' ')} ${shellQuoteSingle(launchSpec.shell)} -c ${shellQuoteSingle(inner)}`;
 }
 
 function assertShellEnvKey(key: string): void {
@@ -1220,7 +1232,6 @@ export function buildWorkerProcessLaunchSpec(
     OMX_TEAM_INTERNAL_WORKER: internalWorkerIdentity,
     [OMX_LEADER_NODE_PATH_ENV]: resolveLeaderNodePath(),
     [OMX_LEADER_CLI_PATH_ENV]: resolvedLauncherPath,
-    [OMX_TMUX_HUD_OWNER_ENV]: '1',
     ...(workerCli === 'codex' && workerCodexHomeOverride
       ? { CODEX_HOME: workerCodexHomeOverride }
       : {}),
@@ -1238,7 +1249,7 @@ export function buildWorkerProcessLaunchSpec(
     workerCli,
     command: platformSpec.command,
     args: platformSpec.args,
-    env: workerEnv,
+    env: scrubTeamWorkerHudOwnershipEnv(workerEnv),
   };
 }
 

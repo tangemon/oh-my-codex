@@ -10,6 +10,7 @@ import {
   hasCurrentTmuxClientContext,
   createTeamSession,
   buildWorkerProcessLaunchSpec,
+  scrubTeamWorkerHudOwnershipEnv,
   resolveTeamWorkerCli,
   type TeamWorkerCli,
   resolveTeamWorkerCliPlan,
@@ -2236,7 +2237,7 @@ function spawnPromptWorker(
     initialPrompt,
     workerRole,
   );
-  const childEnv = { ...process.env, ...processSpec.env };
+  const childEnv = scrubTeamWorkerHudOwnershipEnv({ ...process.env, ...processSpec.env });
   // Prompt workers are external CLI processes, not in-process runtime code.
   // Keeping c8's NODE_V8_COVERAGE in their environment makes coverage runs
   // track long-lived fake worker descendants and can keep node --test alive
@@ -3681,12 +3682,9 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
       worker: 'leader-fixed',
       reason: 'force_bypass',
     }, cwd).catch(() => {});
-  }
 
-  if (force && config.worker_launch_mode === 'prompt') {
-    // Prompt-mode workers are raw CLI children, not team-runtime workers that
-    // participate in the shutdown-ack handshake. Waiting the full ack window
-    // before force-killing them only adds deterministic suite slowness.
+    // Explicit force means teardown now. Do not spend the graceful ack window
+    // waiting for interactive panes or prompt workers that will be killed below.
     skipWorkerAcks = true;
   }
 

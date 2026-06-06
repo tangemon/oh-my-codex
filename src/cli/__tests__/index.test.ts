@@ -1,8 +1,8 @@
 import { afterEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, readFileSync, utimesSync } from "node:fs";
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir as fsReaddir, rm, stat, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir as fsReaddir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { delimiter, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { once } from "node:events";
@@ -78,6 +78,13 @@ import {
   releaseTmuxExtendedKeysLease,
   withTmuxExtendedKeys,
   serializeDetachedSessionParentEnv,
+  buildInsideTmuxHudHookEnv,
+  registerInsideTmuxHudResizeHook,
+  buildDetachedHudHookEnv,
+  registerDetachedHudLayoutReconcileHook,
+  ensureOmxRuntimeCommandShim,
+  omxRuntimeCommandShimPath,
+  prependOmxRuntimeCommandShimToEnv,
   CODEX_SQLITE_HOME_ENV,
   DETACHED_TMUX_HISTORY_LIMIT,
 } from "../index.js";
@@ -2954,7 +2961,19 @@ describe("tmux HUD pane helpers", () => {
       "-t",
       "%leader",
       "-F",
-      "#{pane_id}\x1f#{pane_current_command}\x1f#{pane_start_command}\x1f#{pane_current_path}",
+      [
+        "#{pane_id}",
+        "#{pane_current_command}",
+        "#{pane_left}",
+        "#{pane_top}",
+        "#{pane_width}",
+        "#{pane_height}",
+        "#{pane_bottom}",
+        "#{window_width}",
+        "#{window_height}",
+        "#{pane_start_command}",
+        "#{pane_current_path}",
+      ].join("\x1f"),
     ]);
   });
 
@@ -3283,6 +3302,160 @@ describe("detached tmux new-session sequencing", () => {
     assert.doesNotMatch(envScript, /not-a-shell-name/);
   });
 
+  it("creates a repo-local omx command shim for launched Codex sessions", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-runtime-command-shim-"));
+    try {
+      const shimDir = ensureOmxRuntimeCommandShim(
+        cwd,
+        "/repo/dist/cli/omx.js",
+        "/usr/local/bin/node",
+      );
+      const shimPath = omxRuntimeCommandShimPath(cwd);
+
+      assert.equal(shimDir, dirname(shimPath));
+      assert.equal(existsSync(shimPath), true);
+      assert.equal(await readFile(shimPath, "utf-8"), [
+        "#!/bin/sh",
+        `exec '/usr/local/bin/node' '/repo/dist/cli/omx.js' "$@"`,
+        "",
+      ].join("\n"));
+      assert.equal((await stat(shimPath)).mode & 0o700, 0o700);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("prepends the repo-local omx shim before global PATH entries", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-runtime-command-shim-env-"));
+    try {
+      const env = prependOmxRuntimeCommandShimToEnv(
+        cwd,
+        {
+          PATH: "/opt/homebrew/bin:/usr/bin",
+          OMX_ENTRY_PATH: "/opt/homebrew/lib/node_modules/oh-my-codex/dist/cli/omx.js",
+        },
+        "/repo/dist/cli/omx.js",
+        "/usr/local/bin/node",
+      );
+      const shimDir = dirname(omxRuntimeCommandShimPath(cwd));
+
+      assert.equal(env.PATH, `${shimDir}${delimiter}/opt/homebrew/bin:/usr/bin`);
+      assert.equal(env.OMX_ENTRY_PATH, "/repo/dist/cli/omx.js");
+      assert.equal(env.OMX_STARTUP_CWD, cwd);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("executes the repo-local omx shim before a stale global omx with misleading success output", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-runtime-command-shim-exec-"));
+    try {
+      const fakeGlobalBin = join(cwd, "fake-global-bin");
+      const fakeLocalBin = join(cwd, "fake local's $() ; bin");
+      await mkdir(fakeGlobalBin);
+      await mkdir(fakeLocalBin);
+      const globalMarker = join(cwd, "GLOBAL_CALLED");
+      const localMarker = join(cwd, "LOCAL_CALLED");
+      const fakeGlobalOmx = join(fakeGlobalBin, "omx");
+      const fakeNode = join(fakeLocalBin, "node runner");
+      const localOmxEntry = join(fakeLocalBin, "omx entry's $() ;.js");
+
+      await writeFile(fakeGlobalOmx, `#!/bin/sh
+printf 'global-called\\n' > "${globalMarker}"
+printf '{"success":true,"source":"global"}\\n'
+exit 0
+`);
+      await chmod(fakeGlobalOmx, 0o755);
+      await writeFile(fakeNode, `#!/bin/sh
+printf '%s\\n' "$@" > "${localMarker}"
+printf '{"success":true,"source":"local"}\\n'
+exit 0
+`);
+      await chmod(fakeNode, 0o755);
+
+      const env = prependOmxRuntimeCommandShimToEnv(
+        cwd,
+        { PATH: `${fakeGlobalBin}${delimiter}/usr/bin:/bin` },
+        localOmxEntry,
+        fakeNode,
+      );
+      const { execFileSync } = await import("node:child_process");
+      const output = execFileSync("omx", ["team", "status", "hud-check"], {
+        cwd,
+        env,
+        encoding: "utf-8",
+      });
+
+      assert.match(output, /"source":"local"/);
+      assert.equal(existsSync(globalMarker), false);
+      assert.deepEqual((await readFile(localMarker, "utf-8")).trim().split("\n"), [
+        localOmxEntry,
+        "team",
+        "status",
+        "hud-check",
+      ]);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("overwrites stale runtime shim contents and permissions", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-runtime-command-shim-stale-"));
+    try {
+      const shimPath = omxRuntimeCommandShimPath(cwd);
+      await mkdir(dirname(shimPath), { recursive: true });
+      await writeFile(shimPath, "#!/bin/sh\necho stale-global\n");
+      await chmod(shimPath, 0o600);
+
+      ensureOmxRuntimeCommandShim(cwd, "/repo/dist/cli/omx.js", "/usr/local/bin/node");
+
+      assert.equal(await readFile(shimPath, "utf-8"), [
+        "#!/bin/sh",
+        `exec '/usr/local/bin/node' '/repo/dist/cli/omx.js' "$@"`,
+        "",
+      ].join("\n"));
+      assert.equal((await stat(shimPath)).mode & 0o777, 0o700);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("replaces a stale runtime shim symlink without following it", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-runtime-command-shim-symlink-"));
+    try {
+      if (process.platform === "win32") return;
+      const shimPath = omxRuntimeCommandShimPath(cwd);
+      const externalTarget = join(cwd, "outside-target");
+      await mkdir(dirname(shimPath), { recursive: true });
+      await writeFile(externalTarget, "do not overwrite\n");
+      await symlink(externalTarget, shimPath);
+
+      ensureOmxRuntimeCommandShim(cwd, "/repo/dist/cli/omx.js", "/usr/local/bin/node");
+
+      assert.equal(await readFile(externalTarget, "utf-8"), "do not overwrite\n");
+      assert.equal((await lstat(shimPath)).isSymbolicLink(), false);
+      assert.match(await readFile(shimPath, "utf-8"), /\/repo\/dist\/cli\/omx\.js/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("throws when the runtime shim bin path is not a directory", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-runtime-command-shim-file-"));
+    try {
+      const shimPath = omxRuntimeCommandShimPath(cwd);
+      await mkdir(dirname(dirname(shimPath)), { recursive: true });
+      await writeFile(dirname(shimPath), "not a directory\n");
+
+      assert.throws(
+        () => ensureOmxRuntimeCommandShim(cwd, "/repo/dist/cli/omx.js", "/usr/local/bin/node"),
+        /not a directory/,
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("keeps detached tmux bootstrap bounded when no interactive parent env file is requested", () => {
     const steps = buildDetachedSessionBootstrapSteps(
       "omx-demo",
@@ -3347,8 +3520,151 @@ describe("detached tmux new-session sequencing", () => {
     const source = await readFile(join(repoRoot, 'src', 'cli', 'index.ts'), 'utf-8');
     assert.match(
       source,
-      /registerHudResizeHook\(hudPaneId,\s*currentPaneId,\s*HUD_TMUX_HEIGHT_LINES\)/,
+      /registerInsideTmuxHudResizeHook\(\{\s*hudPaneId,\s*currentPaneId,\s*cwd,\s*sessionId,\s*omxRootOverride,\s*\}\)/,
     );
+    assert.match(
+      source,
+      /if \(currentPaneId\) \{\s*unregisterHudResizeHook\(currentPaneId\);\s*\}/,
+    );
+  });
+
+  it("buildInsideTmuxHudHookEnv tags hook commands with session, owner, leader, and local root", () => {
+    const env = buildInsideTmuxHudHookEnv(
+      { PATH: "/bin" },
+      "sess-a",
+      "%leader",
+      "/repo",
+    );
+
+    assert.equal(env.PATH, "/bin");
+    assert.equal(env.OMX_SESSION_ID, "sess-a");
+    assert.equal(env.OMX_TMUX_HUD_OWNER, "1");
+    assert.equal(env.OMX_TMUX_HUD_LEADER_PANE, "%leader");
+    assert.equal(env.OMX_ROOT, "/repo");
+  });
+
+  it("registerInsideTmuxHudResizeHook forwards cwd and env to hook registration", () => {
+    const calls: Array<{
+      hudPaneId: string;
+      leaderPaneId: string | undefined;
+      heightLines: number;
+      cwd?: string;
+      env?: NodeJS.ProcessEnv;
+    }> = [];
+
+    const result = registerInsideTmuxHudResizeHook({
+      hudPaneId: "%hud",
+      currentPaneId: "%leader",
+      cwd: "/repo",
+      sessionId: "sess-a",
+      omxRootOverride: "/repo",
+      baseEnv: { PATH: "/bin" },
+      register: (hudPaneId, leaderPaneId, heightLines, options) => {
+        calls.push({ hudPaneId, leaderPaneId, heightLines, cwd: options?.cwd, env: options?.env });
+        return true;
+      },
+    });
+
+    assert.equal(result, true);
+    assert.deepEqual(calls, [{
+      hudPaneId: "%hud",
+      leaderPaneId: "%leader",
+      heightLines: HUD_TMUX_HEIGHT_LINES,
+      cwd: "/repo",
+      env: {
+        PATH: "/bin",
+        OMX_SESSION_ID: "sess-a",
+        OMX_TMUX_HUD_OWNER: "1",
+        OMX_TMUX_HUD_LEADER_PANE: "%leader",
+        OMX_ROOT: "/repo",
+      },
+    }]);
+    assert.equal(registerInsideTmuxHudResizeHook({
+      hudPaneId: null,
+      currentPaneId: "%leader",
+      cwd: "/repo",
+      sessionId: "sess-a",
+      register: () => {
+        throw new Error("should not register without a HUD pane");
+      },
+    }), false);
+  });
+
+  it("buildDetachedHudHookEnv preserves tmux targeting and local launcher identity", () => {
+    const env = buildDetachedHudHookEnv(
+      { PATH: "/bin" },
+      "sess-a",
+      "%leader",
+      "/tmp/tmux.sock,123,7",
+      "/repo/dist/cli/omx.js",
+      "/repo",
+    );
+
+    assert.equal(env.PATH, "/bin");
+    assert.equal(env.TMUX, "/tmp/tmux.sock,123,7");
+    assert.equal(env.TMUX_PANE, "%leader");
+    assert.equal(env.OMX_SESSION_ID, "sess-a");
+    assert.equal(env.OMX_TMUX_HUD_OWNER, "1");
+    assert.equal(env.OMX_ROOT, "/repo");
+    assert.equal(env.OMX_ENTRY_PATH, "/repo/dist/cli/omx.js");
+  });
+
+  it("registerDetachedHudLayoutReconcileHook reads TMUX from the detached leader pane before registering", () => {
+    const calls: Array<{
+      hudPaneId: string;
+      leaderPaneId: string | undefined;
+      heightLines: number;
+      cwd?: string;
+      env?: NodeJS.ProcessEnv;
+    }> = [];
+    const readTargets: string[] = [];
+
+    const result = registerDetachedHudLayoutReconcileHook({
+      hudPaneId: "%hud",
+      detachedLeaderPaneId: "%leader",
+      cwd: "/repo",
+      sessionId: "sess-a",
+      omxBin: "/repo/dist/cli/omx.js",
+      omxRootOverride: "/repo",
+      baseEnv: { PATH: "/bin" },
+      readTmuxEnvValue: (targetPaneId) => {
+        readTargets.push(targetPaneId);
+        return "/tmp/tmux.sock,123,7";
+      },
+      register: (hudPaneId, leaderPaneId, heightLines, options) => {
+        calls.push({ hudPaneId, leaderPaneId, heightLines, cwd: options?.cwd, env: options?.env });
+        return true;
+      },
+    });
+
+    assert.equal(result, true);
+    assert.deepEqual(readTargets, ["%leader"]);
+    assert.deepEqual(calls, [{
+      hudPaneId: "%hud",
+      leaderPaneId: "%leader",
+      heightLines: HUD_TMUX_HEIGHT_LINES,
+      cwd: "/repo",
+      env: {
+        PATH: "/bin",
+        TMUX: "/tmp/tmux.sock,123,7",
+        TMUX_PANE: "%leader",
+        OMX_SESSION_ID: "sess-a",
+        OMX_TMUX_HUD_OWNER: "1",
+        OMX_ROOT: "/repo",
+        OMX_ENTRY_PATH: "/repo/dist/cli/omx.js",
+      },
+    }]);
+    assert.equal(registerDetachedHudLayoutReconcileHook({
+      hudPaneId: "%hud",
+      detachedLeaderPaneId: "%leader",
+      cwd: "/repo",
+      sessionId: "sess-a",
+      omxBin: "/repo/dist/cli/omx.js",
+      readTmuxEnvValue: () => undefined,
+      register: () => {
+        throw new Error("should not register without TMUX");
+      },
+    }), false);
   });
 
   it("buildDetachedSessionBootstrapSteps starts native Windows detached sessions with powershell", () => {
