@@ -6974,7 +6974,7 @@ async function buildRalplanPreToolUseBoundaryOutput(
   resolvedSessionId?: string,
 ): Promise<Record<string, unknown> | null> {
   const sessionId = safeString(resolvedSessionId ?? readPayloadSessionId(payload)).trim();
-  if (await hasTrustedTypedSubagentProvenanceForPreToolUse(payload, cwd, sessionId)) return null;
+  if (await hasTrustedTypedSubagentProvenanceForPreToolUse(payload, cwd, stateDir, sessionId)) return null;
   const threadId = readPayloadThreadId(payload);
   const activeState = await readActiveRalplanStateForPreToolUse(cwd, stateDir, sessionId, threadId);
   if (!activeState) return null;
@@ -7042,7 +7042,7 @@ async function buildDeepInterviewPreToolUseBoundaryOutput(
   resolvedSessionId?: string,
 ): Promise<Record<string, unknown> | null> {
   const sessionId = safeString(resolvedSessionId ?? readPayloadSessionId(payload)).trim();
-  if (await hasTrustedTypedSubagentProvenanceForPreToolUse(payload, cwd, sessionId)) return null;
+  if (await hasTrustedTypedSubagentProvenanceForPreToolUse(payload, cwd, stateDir, sessionId)) return null;
   const threadId = readPayloadThreadId(payload);
   const activeState = await readActiveDeepInterviewStateForPreToolUse(cwd, stateDir, sessionId, threadId);
   if (!activeState) return null;
@@ -7213,17 +7213,67 @@ interface ActiveConductorState {
 async function hasTrustedTypedSubagentProvenanceForPreToolUse(
   payload: CodexHookPayload,
   cwd: string,
+  stateDir: string,
   sessionId: string,
+  options: { allowUntypedProvenance?: boolean } = {},
 ): Promise<boolean> {
   if (hasTeamWorkerEnvironment()) return true;
-  if (!isTypedAgentRolePayload(payload)) return false;
   const trackingState = await readSubagentTrackingState(cwd).catch(() => null);
   const session = trackingState?.sessions?.[sessionId];
   if (!session) return false;
 
   const payloadThreadId = readPayloadThreadId(payload);
+
+  // Resolve the Main-root leader THREAD identity from the tracker's leader_thread_id
+  // plus the canonical session's native_session_id (the leader's native thread). Only
+  // genuine leader-thread identifiers may anchor the leader: owner_*_session_id are
+  // session-level ids, not thread anchors, so they must NOT populate this set — their
+  // mere presence would make it non-empty and suppress the fail-closed guard below
+  // without ever excluding the leader thread (#3117 P4). The native_session_id anchor is
+  // honored only when the root session pointer provably maps to the sessionId under
+  // evaluation, so a stale/foreign session.json cannot supply another session's leader
+  // anchor (#3117 P3); the tracker alone is insufficient because it can omit
+  // leader_thread_id or corruptly label the leader kind:"subagent" (#3117 P2).
+  const sessionState = await readRootSessionStateFromStateDir(stateDir).catch(() => null);
+  const trackerLeaderThreadId = safeString(session.leader_thread_id).trim();
+  const leaderIdentityAnchors = new Set<string>();
+  if (trackerLeaderThreadId) leaderIdentityAnchors.add(trackerLeaderThreadId);
+  if (sessionState && sessionId && payloadMatchesSessionPointer(sessionId, sessionState)) {
+    const nativeSessionId = safeString(sessionState.native_session_id).trim();
+    if (nativeSessionId) leaderIdentityAnchors.add(nativeSessionId);
+  }
+
+  // Leader self-guard: the Main-root Conductor is never a delegated executor. Block it
+  // ahead of every trust path, even when tracker or payload provenance is (possibly
+  // corruptly) attached to the leader thread.
+  if (payloadThreadId && leaderIdentityAnchors.has(payloadThreadId)) return false;
+
+  // Fail closed: without an authoritative leader anchor we cannot affirm the payload is
+  // a non-leader delegated performer rather than a mislabeled leader, so we refuse trust
+  // instead of inferring it from a corrupt tracker kind:"subagent" alone (#3117 P2).
+  if (leaderIdentityAnchors.size === 0) return false;
+
+  // Planning boundary guards (ralplan, deep-interview) still require a recognized typed
+  // agent role, so an untyped collaboration.spawn_agent child cannot write before an
+  // execution handoff/approval. Only the Main-root Conductor/Ralph executing guard opts
+  // into untyped tracker/runtime provenance (#3116, #3117).
+  if (options.allowUntypedProvenance !== true && !isTypedAgentRolePayload(payload)) {
+    return false;
+  }
+
+  // Tracker-backed provenance: the payload's own thread is a recorded, non-leader
+  // subagent for this session — the non-spoofable anchor that lets native
+  // collaboration.spawn_agent children/descendants edit under the Conductor guard even
+  // without a recognized typed role (#3116). subagent-tracking.json is derived from
+  // child SessionStart transcript metadata, not the live tool-call payload.
   if (payloadThreadId && isTrustedSubagentThread(session, payloadThreadId)) return true;
 
+  // Runtime-attached spawn provenance: trust a genuine spawned subagent turn whose
+  // declared parent maps to this session's leader or a tracked thread. parentThreadId
+  // comes from the runtime-set source.subagent.thread_spawn (not agent-controlled tool
+  // arguments); an absent parent is rejected, the leader self-guard above blocks the
+  // main root, and cross-session parents fail because they are not in this session's
+  // tracked threads (#3116).
   const source = safeObject(payload.source);
   const subagent = safeObject(source.subagent);
   const threadSpawn = safeObject(subagent.thread_spawn);
@@ -7234,9 +7284,7 @@ async function hasTrustedTypedSubagentProvenanceForPreToolUse(
       ?? threadSpawn.leaderThreadId,
   ).trim();
   if (!parentThreadId) return false;
-  const leaderThreadId = safeString(session.leader_thread_id).trim();
-  if (payloadThreadId && leaderThreadId && payloadThreadId === leaderThreadId) return false;
-  return leaderThreadId === parentThreadId || parentThreadId in session.threads;
+  return leaderIdentityAnchors.has(parentThreadId) || parentThreadId in session.threads;
 }
 
 function isActiveConductorModeState(state: Record<string, unknown> | null, mode: string, sessionId: string): boolean {
@@ -7265,7 +7313,7 @@ async function readActiveMainRootConductorStateForPreToolUse(
   }
   const threadId = readPayloadThreadId(payload);
   if (!sessionId) return null;
-  if (await hasTrustedTypedSubagentProvenanceForPreToolUse(payload, cwd, sessionId)) return null;
+  if (await hasTrustedTypedSubagentProvenanceForPreToolUse(payload, cwd, stateDir, sessionId, { allowUntypedProvenance: true })) return null;
 
   const canonicalState = await readVisibleSkillActiveStateForStateDir(stateDir, sessionId);
   if (!canonicalState) return null;
