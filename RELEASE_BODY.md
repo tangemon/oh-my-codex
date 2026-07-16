@@ -29,7 +29,7 @@ Patch release with no intentional breaking CLI or package-layout changes.
 
 ## Validation
 
-Local build, lint, typecheck, full Node/Rust tests, and packed-install smoke gates passed against the release candidate. The packed smoke used an isolated Codex CLI 0.142.5 boundary. Final review, CI, tag, GitHub release, npm publication, and public-install receipts remain pending in `docs/qa/release-readiness-0.20.2.md`.
+Local build, lint, typecheck, full Node/Rust tests, packed-install smoke, independent review, `dev` and `main` candidate CI, all seven native builds, native-asset verification, GitHub release publication, npm provenance publication, and isolated public-registry install/CLI boot passed for the shipped candidate. The packed smoke used the exact Codex CLI 0.142.5 boundary. Full evidence is recorded in `docs/qa/release-readiness-0.20.2.md`.
 
 ## Contributors
 
