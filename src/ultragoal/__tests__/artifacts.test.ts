@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
@@ -20,7 +20,11 @@ import {
   type UltragoalPlan,
   type UltragoalSteeringProposal,
 } from '../artifacts.js';
-import { LEADER_CONDUCTOR_BLOCK, buildUnsupportedNativeSubagentGuidance } from '../../leader/contract.js';
+import {
+  LEADER_CONDUCTOR_BLOCK,
+  buildRoleRoutingUnavailableGuidance,
+  buildUnsupportedNativeSubagentGuidance,
+} from '../../leader/contract.js';
 import { steeringFixtures, type SteeringFixtureProposal } from './steering-fixtures.js';
 
 async function withTempRepo<T>(run: (cwd: string) => Promise<T>): Promise<T> {
@@ -117,6 +121,7 @@ function toSteeringProposal(proposal: SteeringFixtureProposal): UltragoalSteerin
 }
 
 describe('ultragoal artifacts', () => {
+  // 小白说明：验证用户输入一段 brief 后，系统会创建 brief.md、goals.json 和 ledger.jsonl；主要覆盖 createUltragoalPlan 的目标生成、文件落盘和 ledger 初始化。
   it('creates brief, goals, and ledger artifacts from a brief', async () => {
     await withTempRepo(async (cwd) => {
       const plan = await createUltragoalPlan(cwd, {
@@ -137,6 +142,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证 brief 里有 Stories、验收标准、检查清单时，只把真正的故事变成 goal；主要覆盖 createUltragoalPlan 内部的 brief 解析和 deriveGoalCandidates 分支。
   it('derives story goals without queuing nested criteria or plain-label checklist items', async () => {
     await withTempRepo(async (cwd) => {
       const plan = await createUltragoalPlan(cwd, {
@@ -161,6 +167,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证只有检查清单/验收标准时，不会把每条检查项误当成任务；主要覆盖 createUltragoalPlan 的非故事内容兜底逻辑。
   it('does not fall back to checklist bullets when a brief has only non-story sections', async () => {
     await withTempRepo(async (cwd) => {
       const plan = await createUltragoalPlan(cwd, {
@@ -173,6 +180,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证 RALPLAN 评审记录和共识记录不会被拆成一堆假 goal；主要覆盖 createUltragoalPlan 对 review/consensus 文档段落的过滤。
   it('does not atomize RALPLAN review and consensus sections into pseudo-goals', async () => {
     await withTempRepo(async (cwd) => {
       const brief = [
@@ -201,6 +209,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证宽泛的大段 markdown 不会被系统猜测成 20 多个 goal，而是要求用户明确写 story；主要覆盖 createUltragoalPlan 的 fail-closed 防误拆保护。
   it('fails closed for broad implicit plan-like markdown without compact stories', async () => {
     await withTempRepo(async (cwd) => {
       const broadBrief = [
@@ -216,6 +225,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证缩进的说明文字不会打断后续同级故事识别；主要覆盖 createUltragoalPlan 的缩进段落解析。
   it('keeps later sibling stories after an indented plain-label note', async () => {
     await withTempRepo(async (cwd) => {
       const plan = await createUltragoalPlan(cwd, {
@@ -227,6 +237,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证文档前言里的 bullet 不会抢过 Stories 区域里的正式任务；主要覆盖 createUltragoalPlan 的故事区优先级规则。
   it('prefers story-section goals over preface bullets', async () => {
     await withTempRepo(async (cwd) => {
       const plan = await createUltragoalPlan(cwd, {
@@ -237,6 +248,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证缩进的 story 标题也能被识别，并优先于前言 bullet；主要覆盖 createUltragoalPlan 的 markdown 标题识别。
   it('prefers indented markdown story headings over preface bullets', async () => {
     await withTempRepo(async (cwd) => {
       const plan = await createUltragoalPlan(cwd, {
@@ -247,6 +259,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证缩进的 ATX 标题说明不会吞掉后面的同级 story；主要覆盖 createUltragoalPlan 的标题/缩进边界处理。
   it('keeps sibling stories after an indented ATX note heading', async () => {
     await withTempRepo(async (cwd) => {
       const plan = await createUltragoalPlan(cwd, {
@@ -258,6 +271,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证空行加缩进标题的组合也不会破坏故事列表；主要覆盖 createUltragoalPlan 对空行和缩进标题的连续解析。
   it('keeps sibling stories after a blank before an indented ATX note heading', async () => {
     await withTempRepo(async (cwd) => {
       const plan = await createUltragoalPlan(cwd, {
@@ -269,6 +283,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证中间出现非故事段落后，后续顶层 bullet 仍能恢复为 story；主要覆盖 createUltragoalPlan 的段落状态恢复。
   it('resumes unlabeled top-level story bullets after a non-story section break', async () => {
     await withTempRepo(async (cwd) => {
       const plan = await createUltragoalPlan(cwd, {
@@ -279,6 +294,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证重复写出的任务不会生成重复 goal；主要覆盖 createUltragoalPlan 的去重逻辑。
   it('deduplicates derived list goals', async () => {
     await withTempRepo(async (cwd) => {
       const plan = await createUltragoalPlan(cwd, {
@@ -289,6 +305,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证单数 Story 标题也被当成正式故事区；主要覆盖 createUltragoalPlan 对 Story/Stories 标题变体的识别。
   it('recognizes singular story headings when choosing goals over preface bullets', async () => {
     await withTempRepo(async (cwd) => {
       const plan = await createUltragoalPlan(cwd, {
@@ -299,6 +316,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证 ultragoal 默认一次只启动一个 story，并生成 aggregate Codex goal handoff；主要覆盖 startNextUltragoal 和 buildCodexGoalInstruction。
   it('starts one story at a time and emits an aggregate Codex goal handoff by default', async () => {
     await withTempRepo(async (cwd) => {
       await createUltragoalPlan(cwd, {
@@ -338,6 +356,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证最终 story 必须有独立 code-reviewer 和 architect 证据，native subagent 不可用时会降级为 blocker 指引；主要覆盖 buildCodexGoalInstruction 的最终门禁文案。
   it('emits final-story handoffs that block missing independent review before update_goal', async () => {
     await withTempRepo(async (cwd) => {
       await createUltragoalPlan(cwd, {
@@ -378,9 +397,26 @@ describe('ultragoal artifacts', () => {
       assert.match(unsupportedInstruction, /record-review-blockers/);
       assert.match(unsupportedInstruction, /non-clean blocker/);
       assert.match(unsupportedInstruction, /Native independent review unavailable/);
+
+      const roleRoutingUnavailableSupport = {
+        status: 'role_routing_unavailable' as const,
+        source: 'persisted_role_routing_marker' as const,
+        evidenceSummary: 'spawn_agent exists but the surface does not expose agent_type',
+      };
+      const roleRoutingUnavailableInstruction = buildCodexGoalInstruction(perStory.goal!, perStory.plan, {
+        nativeSubagentSupport: roleRoutingUnavailableSupport,
+      });
+      assert.doesNotMatch(roleRoutingUnavailableInstruction, /Conductor mode contract:/);
+      assert.match(
+        roleRoutingUnavailableInstruction,
+        new RegExp(escapeRegExp(buildRoleRoutingUnavailableGuidance(roleRoutingUnavailableSupport))),
+      );
+      assert.match(roleRoutingUnavailableInstruction, /adapted role-specific consensus/i);
+      assert.match(roleRoutingUnavailableInstruction, /role-intent ledger/i);
     });
   });
 
+  // 小白说明：验证一个 goal 完成后会推进到下一个，失败后可以 retry；主要覆盖 checkpointUltragoal 和 startNextUltragoal 的成功、失败、重试主流程。
   it('checkpoints success, advances, and supports failed-goal retry', async () => {
     await withTempRepo(async (cwd) => {
       await createUltragoalPlan(cwd, {
@@ -441,6 +477,7 @@ describe('ultragoal artifacts', () => {
   });
 
 
+  // 小白说明：验证 Codex 已完成的是整个任务时，OMX 能把当前 microgoal 和 aggregate 状态一起收口；主要覆盖 checkpointUltragoal 的 task-scoped aggregate reconciliation。
   it('reconciles completed task-scoped Codex proof to finish exploded aggregate ultragoal bookkeeping', async () => {
     await withTempRepo(async (cwd) => {
       const taskObjective = 'Fix the mismatch between Codex immutable completed goal snapshots and OMX ultragoal checkpoint reconciliation.';
@@ -486,6 +523,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证没有足够证据把 Codex 完成状态映射到 ultragoal 时，系统拒绝完成；主要覆盖 checkpointUltragoal 的 objective mismatch 和质量门禁失败分支。
   it('fails closed for task-scoped aggregate completion without plan mapping or evidence', async () => {
     await withTempRepo(async (cwd) => {
       const taskObjective = 'Implement the reconciler fix described in the approved ultragoal brief.';
@@ -543,6 +581,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证不能拿非当前 active microgoal 去消费已完成的 aggregate Codex 证明；主要覆盖 checkpointUltragoal 的 active goal 校验。
   it('fails closed for task-scoped aggregate completion on a non-active microgoal id', async () => {
     await withTempRepo(async (cwd) => {
       const taskObjective = 'Fix the mismatch between Codex immutable completed goal snapshots and OMX ultragoal checkpoint reconciliation.';
@@ -580,6 +619,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证中间 story 完成时 Codex goal 仍可 active，最终 story 才要求 Codex goal complete；主要覆盖 checkpointUltragoal 的 final-run 判断。
   it('requires aggregate Codex goal completion only for the final story', async () => {
     await withTempRepo(async (cwd) => {
       await createUltragoalPlan(cwd, {
@@ -614,6 +654,106 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证 blocked checkpoint 输入不完整或 Codex 状态不对时不会改坏当前 active goal；主要覆盖 checkpointUltragoal 的 blocked fail-closed 分支。
+  it('fails closed for malformed blocked checkpoint contexts without changing the active goal', async () => {
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [{ title: 'First', objective: 'Complete first milestone.' }],
+      });
+
+      await assert.rejects(
+        () => checkpointUltragoal(cwd, {
+          goalId: 'G001-first',
+          status: 'blocked',
+          evidence: 'blocked before start',
+        }),
+        /while it is pending; start or resume the ultragoal/,
+      );
+
+      const first = await startNextUltragoal(cwd);
+      await assert.rejects(
+        () => checkpointUltragoal(cwd, {
+          goalId: first.goal!.id,
+          status: 'blocked',
+          evidence: 'blocked without get_goal JSON',
+        }),
+        /pass --codex-goal-json/,
+      );
+      await assert.rejects(
+        () => checkpointUltragoal(cwd, {
+          goalId: first.goal!.id,
+          status: 'blocked',
+          evidence: 'blocked by an active legacy goal',
+          codexGoal: { goal: { objective: 'Different active legacy goal', status: 'active' } },
+        }),
+        /existing Codex goal is active/,
+      );
+      await assert.rejects(
+        () => checkpointUltragoal(cwd, {
+          goalId: first.goal!.id,
+          status: 'blocked',
+          evidence: 'blocked by a completed legacy goal without objective',
+          codexGoal: { goal: { status: 'complete' } },
+        }),
+        /missing objective text/,
+      );
+
+      const plan = await readUltragoalPlan(cwd);
+      assert.equal(plan.activeGoalId, first.goal!.id);
+      assert.equal(plan.goals[0]?.status, 'in_progress');
+      assert.equal(plan.goals[0]?.failureReason, undefined);
+    });
+  });
+
+  // 小白说明：验证同一个外部授权问题重复失败 3 次后，会停在 needs_user_decision 等人决策；主要覆盖 checkpointUltragoal 的 external authorization blocker 计数和熔断。
+  it('circuit-breaks repeated external authorization failures into a user-decision state', async () => {
+    await withTempRepo(async (cwd) => {
+      const ghcrBlocker = [
+        'GHCR_USERNAME/GHCR_READ_TOKEN/GHCR_BEARER_TOKEN unset;',
+        'gh auth scopes omit read:packages;',
+        'package API returns HTTP 403 requiring read:packages;',
+        'anonymous image verifier returns HTTP 401 authentication required.',
+      ].join(' ');
+
+      await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [{ title: 'Prove GHCR smoke service', objective: 'Verify GHCR pull access.' }],
+      });
+
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        const started = await startNextUltragoal(cwd, { retryFailed: attempt > 1 });
+        assert.equal(started.goal?.id, 'G001-prove-ghcr-smoke-service');
+        const plan = await checkpointUltragoal(cwd, {
+          goalId: started.goal!.id,
+          status: 'failed',
+          evidence: ghcrBlocker,
+        });
+        const goal = plan.goals[0];
+        assert.equal(goal?.blockerOccurrenceCount, attempt);
+        assert.match(goal?.blockerSignature ?? '', /GHCR_PULL_ACCESS/);
+        if (attempt < 3) {
+          assert.equal(goal?.status, 'failed');
+          assert.equal(goal?.nonRetriable, undefined);
+        } else {
+          assert.equal(goal?.status, 'needs_user_decision');
+          assert.equal(goal?.nonRetriable, true);
+          assert.match(goal?.requiredExternalDecision ?? '', /make the GHCR package public/);
+          assert.match(goal?.blockedReason ?? '', /GHCR_USERNAME/);
+        }
+      }
+
+      const retry = await startNextUltragoal(cwd, { retryFailed: true });
+      assert.equal(retry.goal, null);
+      assert.equal(retry.done, false);
+
+      const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+      assert.match(ledger, /"event":"goal_needs_user_decision"/);
+      assert.match(ledger, /GHCR_PULL_ACCESS/);
+    });
+  });
+
+  // 小白说明：验证老版本 goals.json 没有 codexGoalMode 时仍按 per-story 兼容运行；主要覆盖 readUltragoalPlanForMutation 和 startNextUltragoal 的 legacy 兼容。
   it('treats existing v1 plans without mode metadata as legacy per-story plans', async () => {
     await withTempRepo(async (cwd) => {
       const created = await createUltragoalPlan(cwd, {
@@ -646,6 +786,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证追加新 goal 不会把 aggregate Codex objective 改成某个单独 story；主要覆盖 addUltragoalGoal 和 aggregate objective 稳定性。
   it('appends goals without changing the stored aggregate objective', async () => {
     await withTempRepo(async (cwd) => {
       const plan = await createUltragoalPlan(cwd, {
@@ -670,7 +811,8 @@ describe('ultragoal artifacts', () => {
     });
   });
 
-  it('migrates legacy enumerated aggregate objectives to the pointer contract', async () => {
+  // 小白说明：验证 readUltragoalPlan 只是读文件，不会偷偷迁移或写 ledger；主要覆盖 readUltragoalPlan 的纯读契约。
+  it('keeps readUltragoalPlan pure when legacy enumerated aggregate objectives need migration', async () => {
     await withTempRepo(async (cwd) => {
       await mkdir(join(cwd, '.omx/ultragoal'), { recursive: true });
       const legacyObjective = 'Complete all ultragoal stories in .omx/ultragoal/goals.json: G001-first First; G002-second Second';
@@ -689,21 +831,107 @@ describe('ultragoal artifacts', () => {
         ],
       }, null, 2)}\n`);
       await writeFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), '');
+      const planPath = join(cwd, '.omx/ultragoal/goals.json');
+      const ledgerPath = join(cwd, '.omx/ultragoal/ledger.jsonl');
+      const beforePlanMtime = (await stat(planPath)).mtimeMs;
+      const beforeLedgerMtime = (await stat(ledgerPath)).mtimeMs;
 
       const plan = await readUltragoalPlan(cwd);
 
-      assert.equal(plan.codexObjective, ULTRAGOAL_AGGREGATE_CODEX_OBJECTIVE);
-      assert.deepEqual(plan.codexObjectiveAliases, [legacyObjective]);
-      assert.doesNotMatch(plan.codexObjective ?? '', /G001-first/);
-      const persisted = JSON.parse(await readFile(join(cwd, '.omx/ultragoal/goals.json'), 'utf-8')) as UltragoalPlan;
-      assert.equal(persisted.codexObjective, ULTRAGOAL_AGGREGATE_CODEX_OBJECTIVE);
-      assert.deepEqual(persisted.codexObjectiveAliases, [legacyObjective]);
-      const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
-      assert.match(ledger, /"event":"aggregate_objective_migrated"/);
-      assert.match(ledger, /legacy enumerated aggregate Codex objective/);
+      assert.equal(plan.codexObjective, legacyObjective);
+      assert.equal((await stat(planPath)).mtimeMs, beforePlanMtime);
+      assert.equal((await stat(ledgerPath)).mtimeMs, beforeLedgerMtime);
+      const persisted = JSON.parse(await readFile(planPath, 'utf-8')) as UltragoalPlan;
+      assert.equal(persisted.codexObjective, legacyObjective);
+      const ledger = await readFile(ledgerPath, 'utf-8');
+      assert.equal(ledger, '');
     });
   });
 
+  // 小白说明：验证旧的、死进程留下的 mutation lock 不会永久卡住写入；主要覆盖 withUltragoalMutationLock 和 recoverStaleUltragoalMutationLock。
+  it('recovers stale ultragoal mutation locks before mutating the plan', async () => {
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [{ title: 'First', objective: 'Complete first milestone.' }],
+      });
+      await writeFile(
+        join(cwd, '.omx/ultragoal/.mutation.lock'),
+        JSON.stringify({ pid: 99999999, createdAt: '2000-01-01T00:00:00.000Z' }),
+      );
+
+      const result = await addUltragoalGoal(cwd, {
+        title: 'After stale lock',
+        objective: 'Mutation proceeds after stale lock recovery.',
+        evidence: 'stale lock recovery verified',
+      });
+
+      assert.equal(result.goal.id, 'G002-after-stale-lock');
+      const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+      assert.match(ledger, /"event":"goal_added"/);
+    });
+  });
+
+  // 小白说明：验证刚出现的坏 lock 可能是别人正在创建锁，不能马上抢走；主要覆盖 recoverStaleUltragoalMutationLock 的新鲜 malformed lock 保护。
+  it('does not recover fresh malformed ultragoal mutation locks', async () => {
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [{ title: 'First', objective: 'Complete first milestone.' }],
+      });
+      await writeFile(join(cwd, '.omx/ultragoal/.mutation.lock'), '');
+      const previousAttempts = process.env.OMX_ULTRAGOAL_MUTATION_LOCK_MAX_ATTEMPTS;
+      process.env.OMX_ULTRAGOAL_MUTATION_LOCK_MAX_ATTEMPTS = '2';
+      try {
+        await assert.rejects(
+          () => addUltragoalGoal(cwd, {
+            title: 'Fresh malformed lock must not be stolen',
+            objective: 'This mutation must not proceed while the fresh lock may be in-flight.',
+            evidence: 'fresh malformed lock protection',
+          }),
+          /Timed out waiting for ultragoal mutation lock/,
+        );
+      } finally {
+        if (typeof previousAttempts === 'string') process.env.OMX_ULTRAGOAL_MUTATION_LOCK_MAX_ATTEMPTS = previousAttempts;
+        else delete process.env.OMX_ULTRAGOAL_MUTATION_LOCK_MAX_ATTEMPTS;
+      }
+      const plan = await readUltragoalPlan(cwd);
+      assert.equal(plan.goals.length, 1);
+    });
+  });
+
+  // 小白说明：验证 lock 看起来很老但持有进程还活着时不能抢锁；主要覆盖 recoverStaleUltragoalMutationLock 的 live PID 防抢占逻辑。
+  it('does not recover stale ultragoal mutation locks while the owner pid is alive', async () => {
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [{ title: 'First', objective: 'Complete first milestone.' }],
+      });
+      const lockPath = join(cwd, '.omx/ultragoal/.mutation.lock');
+      await writeFile(lockPath, JSON.stringify({ pid: process.pid, createdAt: '2000-01-01T00:00:00.000Z' }));
+      const oldTime = new Date('2000-01-01T00:00:00.000Z');
+      await utimes(lockPath, oldTime, oldTime);
+      const previousAttempts = process.env.OMX_ULTRAGOAL_MUTATION_LOCK_MAX_ATTEMPTS;
+      process.env.OMX_ULTRAGOAL_MUTATION_LOCK_MAX_ATTEMPTS = '2';
+      try {
+        await assert.rejects(
+          () => addUltragoalGoal(cwd, {
+            title: 'Live stale lock must not be stolen',
+            objective: 'This mutation must not proceed while the owner pid is alive.',
+            evidence: 'live stale lock protection',
+          }),
+          /Timed out waiting for ultragoal mutation lock/,
+        );
+      } finally {
+        if (typeof previousAttempts === 'string') process.env.OMX_ULTRAGOAL_MUTATION_LOCK_MAX_ATTEMPTS = previousAttempts;
+        else delete process.env.OMX_ULTRAGOAL_MUTATION_LOCK_MAX_ATTEMPTS;
+      }
+      const plan = await readUltragoalPlan(cwd);
+      assert.equal(plan.goals.length, 1);
+    });
+  });
+
+  // 小白说明：验证老 aggregate objective 迁移后，旧 objective 仍作为 alias 被接受；主要覆盖 readUltragoalPlanForMutation、compatibleCodexObjectives 和 checkpointUltragoal。
   it('accepts migrated legacy aggregate objective aliases for active Codex snapshots', async () => {
     await withTempRepo(async (cwd) => {
       const legacyObjective = 'Complete all ultragoal stories in .omx/ultragoal/goals.json: G001-first First; G002-second Second';
@@ -733,6 +961,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证 steering 拆分 goal 时可重复执行同一个幂等 key 而不重复添加；主要覆盖 steerUltragoal 的 split_subgoal、superseded 和 idempotency 分支。
   it('applies steering idempotently and keeps split replacements schedulable', async () => {
     await withTempRepo(async (cwd) => {
       await createUltragoalPlan(cwd, {
@@ -793,6 +1022,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证最终 review 不通过时，原 final goal 会变成 review_blocked，并追加一个 resolver goal；主要覆盖 recordFinalReviewBlockers 和 startNextUltragoal。
   it('records final aggregate review blockers atomically and starts the blocker next', async () => {
     await withTempRepo(async (cwd) => {
       await createUltragoalPlan(cwd, {
@@ -830,6 +1060,76 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证 recordFinalReviewBlockers 只能用于“当前已启动且最后一个未解决 story”；主要覆盖 recordFinalReviewBlockers 的未知 goal、pending、非 final 和 Codex mismatch 错误。
+  it('rejects final review blocker recording outside the active final story path', async () => {
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [
+          { title: 'First', objective: 'Complete first milestone.' },
+          { title: 'Second', objective: 'Complete second milestone.' },
+        ],
+      });
+
+      await assert.rejects(
+        () => recordFinalReviewBlockers(cwd, {
+          goalId: 'G999-missing',
+          title: 'Resolve missing blockers',
+          objective: 'This must not append a blocker for an unknown goal.',
+          evidence: 'code-review REQUEST CHANGES',
+          codexGoal: { goal: { objective: ULTRAGOAL_AGGREGATE_CODEX_OBJECTIVE, status: 'active' } },
+        }),
+        /Unknown ultragoal id: G999-missing/,
+      );
+
+      await assert.rejects(
+        () => recordFinalReviewBlockers(cwd, {
+          goalId: 'G001-first',
+          title: 'Resolve pending blockers',
+          objective: 'This must not append a blocker before the goal is started.',
+          evidence: 'code-review REQUEST CHANGES',
+          codexGoal: { goal: { objective: ULTRAGOAL_AGGREGATE_CODEX_OBJECTIVE, status: 'active' } },
+        }),
+        /while it is pending; start or resume the ultragoal first/,
+      );
+
+      const first = await startNextUltragoal(cwd);
+      await assert.rejects(
+        () => recordFinalReviewBlockers(cwd, {
+          goalId: first.goal!.id,
+          title: 'Resolve non-final blockers',
+          objective: 'This must not append a final-review blocker while later stories remain unresolved.',
+          evidence: 'code-review REQUEST CHANGES',
+          codexGoal: { goal: { objective: first.plan.codexObjective!, status: 'active' } },
+        }),
+        /not the only unresolved ultragoal story/,
+      );
+
+      await checkpointUltragoal(cwd, {
+        goalId: first.goal!.id,
+        status: 'complete',
+        evidence: 'first milestone complete',
+        codexGoal: { goal: { objective: first.plan.codexObjective!, status: 'active' } },
+      });
+      const second = await startNextUltragoal(cwd);
+      await assert.rejects(
+        () => recordFinalReviewBlockers(cwd, {
+          goalId: second.goal!.id,
+          title: 'Resolve mismatched Codex blocker',
+          objective: 'This must not append a blocker without an active matching Codex goal.',
+          evidence: 'code-review REQUEST CHANGES',
+          codexGoal: { goal: { objective: 'unrelated completed task', status: 'complete' } },
+        }),
+        /expected active|get_goal status/i,
+      );
+
+      const plan = await readUltragoalPlan(cwd);
+      assert.equal(plan.goals.length, 2);
+      assert.equal(plan.goals.some((goal) => goal.status === 'review_blocked'), false);
+    });
+  });
+
+  // 小白说明：验证 resolver goal 干净完成后，会把原 review_blocked final story 一起标成 complete；主要覆盖 checkpointUltragoal 的 designated resolver 完成路径。
   it('reconciles a review-blocked final story when the appended resolver completes with a clean quality gate', async () => {
     await withTempRepo(async (cwd) => {
       await createUltragoalPlan(cwd, {
@@ -881,6 +1181,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证只有指定 resolver 能解决原 review_blocked parent，其他 goal 不能伪造解决；主要覆盖 checkpointUltragoal 的 resolverGoalId 校验。
   it('does not reconcile a review-blocked parent from a non-designated resolver goal', async () => {
     await withTempRepo(async (cwd) => {
       await createUltragoalPlan(cwd, {
@@ -930,6 +1231,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证非指定 resolver 即使拿到 completed Codex proof 也不能完成 review-blocked parent；主要覆盖 checkpointUltragoal 的伪造 resolver 防护。
   it('fails closed when a forged non-designated resolver presents completed task-scoped aggregate proof', async () => {
     await withTempRepo(async (cwd) => {
       const taskObjective = 'Fix review-blocked ultragoal resolver reconciliation tracked in .omx/ultragoal/goals.json without allowing forged aggregate completion.';
@@ -992,6 +1294,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证 per-story 模式下 final review 不干净时只记录 blocker，不假装 Codex goal 已完成；主要覆盖 recordFinalReviewBlockers 的 per-story 文案和状态。
   it('records final per-story review blockers without claiming Codex completion', async () => {
     await withTempRepo(async (cwd) => {
       await createUltragoalPlan(cwd, {
@@ -1014,6 +1317,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证最终 clean completion 必须带 ai-slop-cleaner、verification、code-review、架构门禁证据；主要覆盖 checkpointUltragoal 和 validateQualityGate。
   it('requires structured final quality gate evidence for clean completion', async () => {
     await withTempRepo(async (cwd) => {
       await createUltragoalPlan(cwd, {
@@ -1162,6 +1466,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证 brief 里声明的架构不变量必须在最终质量门禁中逐条证明；主要覆盖 collectRequiredArchitectureInvariants 和 validateArchitectureInvariantGate。
   it('requires final architecture invariant proof from the brief before clean completion', async () => {
     await withTempRepo(async (cwd) => {
       await createUltragoalPlan(cwd, {
@@ -1226,6 +1531,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证已接受的 steering 里新增的架构不变量也必须最终证明；主要覆盖 steerUltragoal ledger 记录和 validateArchitectureInvariantGate。
   it('requires final architecture invariant proof from accepted steering annotations', async () => {
     await withTempRepo(async (cwd) => {
       await createUltragoalPlan(cwd, {
@@ -1301,6 +1607,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证“看起来像来源”的装饰性文字不算真实架构证据来源；主要覆盖 validateArchitectureInvariantGate 的 sourceArtifacts/source 引用校验。
   it('rejects decorative architecture invariant provenance labels that omit source artifacts', async () => {
     await withTempRepo(async (cwd) => {
       await createUltragoalPlan(cwd, {
@@ -1373,6 +1680,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证架构不变量如果没有证明或还有 blocker，最终 goal 不能完成，只能记录 blocker；主要覆盖 checkpointUltragoal 和 recordFinalReviewBlockers。
   it('blocks final completion when architecture invariants are unproved or carry blockers', async () => {
     await withTempRepo(async (cwd) => {
       await createUltragoalPlan(cwd, {
@@ -1423,6 +1731,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证遇到旧的 completed Codex goal 阻塞 create_goal 时，只记录非终止 blocker，不把当前 ultragoal 标失败；主要覆盖 checkpointUltragoal 的 blocked 安全恢复路径。
   it('records a completed legacy Codex-goal blocker without failing the active ultragoal', async () => {
     await withTempRepo(async (cwd) => {
       await createUltragoalPlan(cwd, {
@@ -1453,6 +1762,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证受支持的 steering 类型会改 plan 并写结构化审计日志；主要覆盖 steerUltragoal 的 add、revise、reorder、annotate、split、blocked 分支。
   it('accepts core steering mutations and writes structured audit entries', async () => {
     await withTempRepo(async (cwd) => {
       await createUltragoalPlan(cwd, {
@@ -1535,6 +1845,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证 steering 不能弱化质量门禁或偷偷跳过验证；主要覆盖 steerUltragoal 的安全拒绝和 steering_rejected ledger。
   it('rejects weakening steering and records rejected audit evidence', async () => {
     await withTempRepo(async (cwd) => {
       const plan = await createUltragoalPlan(cwd, {
@@ -1570,6 +1881,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证未知 steering kind 不会被猜测执行；主要覆盖 validateUltragoalSteeringProposal 的 unknown kind fail-closed。
   it('rejects unknown steering mutation kinds before audit acceptance', async () => {
     await withTempRepo(async (cwd) => {
       const plan = await createUltragoalPlan(cwd, {
@@ -1596,6 +1908,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证同一个 idempotency key 的 steering 只生效一次，避免重复生成 child goal；主要覆盖 steerUltragoal 的 ledger 去重。
   it('dedupes steering by ledger idempotency key without duplicating child goals', async () => {
     await withTempRepo(async (cwd) => {
       await createUltragoalPlan(cwd, {
@@ -1629,6 +1942,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证被 superseded 或 blocked 的 goal 不会被调度，但 blocked 状态仍会阻止整个计划误判完成；主要覆盖 startNextUltragoal 和 isUltragoalDone。
   it('skips superseded and blocked goals for scheduling while blocked goals prevent completion', async () => {
     await withTempRepo(async (cwd) => {
       await createUltragoalPlan(cwd, {
@@ -1666,6 +1980,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证当前 active goal 被 steering 标成 blocked/superseded 时，会清掉 activeGoalId；主要覆盖 steerUltragoal 的 active goal 清理。
   it('clears the active goal when mark_blocked_superseded supersedes the running goal', async () => {
     await withTempRepo(async (cwd) => {
       await createUltragoalPlan(cwd, {
@@ -1705,6 +2020,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证格式不对的 steering invariant 不会污染 plan，而且只写一条拒绝审计；主要覆盖 steerUltragoal 的 invariant 校验和 rejected ledger。
   it('rejects malformed steering invariants and records a single rejection audit', async () => {
     await withTempRepo(async (cwd) => {
       await createUltragoalPlan(cwd, {
@@ -1746,6 +2062,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证 steering 来源非法或 replacement child 不完整时会拒绝并留审计；主要覆盖 validateUltragoalSteeringProposal 和 steerUltragoal 的输入校验。
   it('rejects invalid steering source and malformed superseded replacement children with audit evidence', async () => {
     await withTempRepo(async (cwd) => {
       await createUltragoalPlan(cwd, {
@@ -1821,6 +2138,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证一组固定 steering fixture 的行为长期不漂移；主要覆盖 validateUltragoalSteeringProposal、steerUltragoal 和 fixture matrix 回放。
   it('replays the G001-core-steering-model fixture matrix against .omx/ultragoal steering behavior', async () => {
     for (const fixture of steeringFixtures) {
       await withTempRepo(async (cwd) => {
@@ -1894,6 +2212,7 @@ describe('ultragoal artifacts', () => {
     }
   });
 
+  // 小白说明：验证遇到“另一个已完成 Codex goal”时，错误信息会指导用户记录 blocked checkpoint 或换可用上下文；主要覆盖 checkpointUltragoal 的 remediation 文案。
   it('guides different completed legacy snapshots to blocked checkpoints and available goal contexts', async () => {
     await withTempRepo(async (cwd) => {
       await createUltragoalPlan(cwd, {
@@ -1923,6 +2242,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证 get_goal 因 DB/schema/context 不可用时，系统提示走可审计 blocked 恢复，而不是直接完成；主要覆盖 checkpointUltragoal 的 unavailable remediation。
   it('guides unavailable get_goal DB/schema errors to auditable blocked recovery instead of completion', async () => {
     await withTempRepo(async (cwd) => {
       await createUltragoalPlan(cwd, {
@@ -1956,6 +2276,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证 get_goal 不可用可以记录为非终止 blocked checkpoint，当前 goal 继续保持 in_progress；主要覆盖 checkpointUltragoal 的 db_schema_context_error 分支。
   it('records unavailable get_goal DB/schema errors as non-terminal blocked audit checkpoints', async () => {
     await withTempRepo(async (cwd) => {
       await createUltragoalPlan(cwd, {
@@ -1982,6 +2303,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证 aggregate Codex goal 已完成但 microgoal 还在跑时，只记录安全 blocker 避免死循环；主要覆盖 checkpointUltragoal 的 safeCompletedAggregateBlocker 分支。
   it('records a safe blocker when the aggregate Codex goal is already complete while a microgoal remains in progress', async () => {
     await withTempRepo(async (cwd) => {
       await createUltragoalPlan(cwd, {
@@ -2012,6 +2334,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证 active 或同 objective 的 Codex goal 不能被当成 blocked checkpoint 绕过；主要覆盖 checkpointUltragoal 的 blocked mismatch 保护。
   it('rejects blocked checkpoints for active or same-objective Codex goals', async () => {
     await withTempRepo(async (cwd) => {
       await createUltragoalPlan(cwd, {
@@ -2045,6 +2368,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证 pending goal 被 split 后，原 goal superseded、child goal 按顺序执行，最终质量门禁不被削弱；主要覆盖 steerUltragoal、startNextUltragoal 和 checkpointUltragoal。
   it('steers a split pending goal through superseded lifecycle without weakening completion gates', async () => {
     await withTempRepo(async (cwd) => {
       await createUltragoalPlan(cwd, {
@@ -2103,6 +2427,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证没有 replacement 的 blocked steering 会跳过调度，但仍让整体计划保持未完成；主要覆盖 steerUltragoal、startNextUltragoal 和 isUltragoalDone。
   it('skips blocked-without-replacement steering while keeping completion blocked', async () => {
     await withTempRepo(async (cwd) => {
       await createUltragoalPlan(cwd, {
@@ -2142,6 +2467,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证带危险指令的 protected steering payload 不会改 plan，只写 rejected 审计；主要覆盖 steerUltragoal 的 protected directive 防护。
   it('rejects protected steering payloads and records a rejected audit without mutation', async () => {
     await withTempRepo(async (cwd) => {
       const created = await createUltragoalPlan(cwd, {
@@ -2169,6 +2495,7 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  // 小白说明：验证已经接受过的 steering 再提交同一个 idempotency key 会返回 deduped，不重复写入；主要覆盖 steerUltragoal 的 accepted ledger 去重。
   it('dedupes accepted steering by idempotency key', async () => {
     await withTempRepo(async (cwd) => {
       await createUltragoalPlan(cwd, {

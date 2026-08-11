@@ -68,6 +68,7 @@ async function capture(run: () => Promise<void>): Promise<{ stdout: string[]; st
 }
 
 describe('cli/ultragoal', () => {
+  // 小白说明：验证 Team worker 不能运行会改 .omx/ultragoal 的命令；主要覆盖 ultragoalCommand 的 mutating command guard 和 assertUltragoalMutationAllowedFromCurrentProcess。
   it('refuses mutating ultragoal commands from Team worker environments', async () => {
     const mutators: string[][] = [
       ['create-goals', '--brief', 'worker must not create'],
@@ -112,6 +113,79 @@ describe('cli/ultragoal', () => {
     }
   });
 
+  // 小白说明：验证被 tracker 标记为 native subagent 的线程不能直接改 leader 的 ultragoal plan；主要覆盖 ultragoalCommand 的 native subagent CLI 拦截。
+  it('refuses mutating ultragoal commands from tracked native subagent environments', async () => {
+    await withCwd(async (cwd) => {
+      await mkdir(join(cwd, '.omx/state'), { recursive: true });
+      await writeFile(join(cwd, '.omx/state/subagent-tracking.json'), JSON.stringify({
+        schemaVersion: 1,
+        sessions: {
+          'session-1': {
+            session_id: 'session-1',
+            leader_thread_id: 'thread-leader',
+            updated_at: '2026-08-11T00:00:00.000Z',
+            threads: {
+              'thread-leader': {
+                thread_id: 'thread-leader',
+                kind: 'leader',
+                first_seen_at: '2026-08-11T00:00:00.000Z',
+                last_seen_at: '2026-08-11T00:00:00.000Z',
+                turn_count: 1,
+              },
+              'thread-child': {
+                thread_id: 'thread-child',
+                kind: 'subagent',
+                first_seen_at: '2026-08-11T00:00:00.000Z',
+                last_seen_at: '2026-08-11T00:00:00.000Z',
+                turn_count: 1,
+                role: 'executor',
+              },
+            },
+          },
+        },
+        pending_role_intents: [],
+      }), 'utf-8');
+
+      const previousThread = process.env.OMX_NATIVE_THREAD_ID;
+      const previousParentThread = process.env.OMX_PARENT_THREAD_ID;
+      process.env.OMX_NATIVE_THREAD_ID = 'thread-child';
+      process.env.OMX_PARENT_THREAD_ID = 'thread-leader';
+      try {
+        const result = await capture(() => ultragoalCommand(['create-goals', '--brief', 'child must not create']));
+        assert.equal(result.exitCode, 1);
+        assert.match(result.stderr.join('\n'), /native subagent thread-child/i);
+        assert.match(result.stderr.join('\n'), /leader-owned/i);
+        assert.equal(existsSync(join(cwd, '.omx/ultragoal/goals.json')), false);
+      } finally {
+        if (typeof previousThread === 'string') process.env.OMX_NATIVE_THREAD_ID = previousThread;
+        else delete process.env.OMX_NATIVE_THREAD_ID;
+        if (typeof previousParentThread === 'string') process.env.OMX_PARENT_THREAD_ID = previousParentThread;
+        else delete process.env.OMX_PARENT_THREAD_ID;
+      }
+    });
+  });
+
+  // 小白说明：验证 subagent-tracking.json 损坏时，带 native thread 身份的 CLI 写命令会保守失败；主要覆盖 readSubagentTrackingStateStrict 失败后的 fail-closed 路径。
+  it('fails closed for mutating ultragoal commands when native subagent tracking is corrupt', async () => {
+    await withCwd(async (cwd) => {
+      await mkdir(join(cwd, '.omx/state'), { recursive: true });
+      await writeFile(join(cwd, '.omx/state/subagent-tracking.json'), '{not valid json', 'utf-8');
+
+      const previousThread = process.env.CODEX_THREAD_ID;
+      process.env.CODEX_THREAD_ID = 'thread-child';
+      try {
+        const result = await capture(() => ultragoalCommand(['create-goals', '--brief', 'corrupt tracker must fail closed']));
+        assert.equal(result.exitCode, 1);
+        assert.match(result.stderr.join('\n'), /subagent tracking.*unreadable|unreadable.*subagent tracking/i);
+        assert.equal(existsSync(join(cwd, '.omx/ultragoal/goals.json')), false);
+      } finally {
+        if (typeof previousThread === 'string') process.env.CODEX_THREAD_ID = previousThread;
+        else delete process.env.CODEX_THREAD_ID;
+      }
+    });
+  });
+
+  // 小白说明：验证 worker 虽然不能改计划，但仍能看 help/status；主要覆盖 ultragoalCommand 对只读命令和 mutating 命令的区分。
   it('allows ultragoal help and status from Team worker environments', async () => {
     await withCwd(async () => {
       await capture(() => ultragoalCommand(['create-goals', '--brief', '- First milestone']));
@@ -136,6 +210,7 @@ describe('cli/ultragoal', () => {
     });
   });
 
+  // 小白说明：验证 help 文案会告诉用户 artifact 路径、goal mode 和最终 review 约束；主要覆盖 ULTRAGOAL_HELP 输出契约。
   it('prints help with artifact and goal-mode constraints', async () => {
     assert.match(ULTRAGOAL_HELP, /create-goals/);
     assert.match(ULTRAGOAL_HELP, /complete-goals/);
@@ -152,6 +227,7 @@ describe('cli/ultragoal', () => {
     assert.match(ULTRAGOAL_HELP, /code-review/);
   });
 
+  // 小白说明：验证 CLI 能从 create-goals 到 complete-goals 启动第一个 goal；主要覆盖 ultragoalCommand 调用 createUltragoalPlan、startNextUltragoal 和 buildCodexGoalInstruction。
   it('creates and starts goals through the command surface', async () => {
     await withCwd(async (cwd) => {
       const created = await capture(() => ultragoalCommand(['create-goals', '--brief', '- First milestone\n- Second milestone']));
@@ -176,6 +252,7 @@ describe('cli/ultragoal', () => {
     });
   });
 
+  // 小白说明：验证不同 native subagent 能力状态会生成不同 conductor 指引；主要覆盖 ultragoalCommand 读取 durable blocker/marker 后传给 buildCodexGoalInstruction。
   it('selects default, unsupported, and role-routing-unavailable conductor guidance from durable state', async () => {
     await withCwd(async (cwd) => {
       await capture(() => ultragoalCommand(['create-goals', '--brief', '- Native subagent guidance']));
@@ -237,6 +314,7 @@ describe('cli/ultragoal', () => {
     });
   });
 
+  // 小白说明：验证 CLI checkpoint 成功后能用 JSON 返回 plan 和 summary；主要覆盖 ultragoalCommand 的 checkpoint/status JSON 输出。
   it('checkpoints a goal and reports status as json', async () => {
     await withCwd(async (cwd) => {
       await capture(() => ultragoalCommand(['create-goals', '--brief', '- First milestone']));
@@ -257,6 +335,7 @@ describe('cli/ultragoal', () => {
     });
   });
 
+  // 小白说明：验证最终 checkpoint 后 CLI 只提示用户手动 /goal clear，不会声称自己清了 Codex hidden state；主要覆盖 complete checkpoint 的终端清理文案。
   it('prints explicit terminal cleanup after final checkpoint without claiming hidden clear', async () => {
     await withCwd(async (cwd) => {
       await capture(() => ultragoalCommand(['create-goals', '--brief', '- Final milestone']));
@@ -280,6 +359,7 @@ describe('cli/ultragoal', () => {
     });
   });
 
+  // 小白说明：验证已有 completed Codex goal 时，handoff 会先提示 remediation，再给 create_goal payload；主要覆盖 buildCodexGoalInstruction 的 preflight 文案顺序。
   it('places completed-goal preflight remediation before create_goal guidance', async () => {
     await withCwd(async () => {
       await capture(() => ultragoalCommand(['create-goals', '--brief', '- First milestone']));
@@ -293,6 +373,7 @@ describe('cli/ultragoal', () => {
     });
   });
 
+  // 小白说明：验证 get_goal DB/schema 不可用时，status 仍能基于 .omx/ultragoal artifact 汇报完成；主要覆盖 ultragoalCommand status 的 fallback 输出。
   it('reports artifact-backed completion when Codex goal DB schema is unavailable', async () => {
     await withCwd(async (cwd) => {
       await capture(() => ultragoalCommand(['create-goals', '--brief', '- First milestone']));
@@ -342,6 +423,7 @@ describe('cli/ultragoal', () => {
     });
   });
 
+  // 小白说明：验证 aggregate 产品完成和 microgoal 账本状态在 CLI summary 里分开显示；主要覆盖 summarizeUltragoalPlan 的 aggregate 字段输出。
   it('labels aggregate product completion separately from microgoal bookkeeping status', async () => {
     await withCwd(async () => {
       const taskObjective = 'Fix ultragoal task-scoped goal reconciliation.';
@@ -365,6 +447,7 @@ describe('cli/ultragoal', () => {
     });
   });
 
+  // 小白说明：验证用户可以用结构化 CLI 参数追加 steering，并看到审计输出；主要覆盖 ultragoalCommand 的 steer 命令和 steerUltragoal。
   it('steers ultragoal plans through structured CLI fields with audit output', async () => {
     await withCwd(async (cwd) => {
       await capture(() => ultragoalCommand(['create-goals', '--brief', '- CLI bridge']));
@@ -399,6 +482,7 @@ describe('cli/ultragoal', () => {
     });
   });
 
+  // 小白说明：验证 CLI steer 的 idempotency key 可以防止重复修改 plan；主要覆盖 ultragoalCommand steer 和 steerUltragoal 的 dedupe 输出。
   it('dedupes structured CLI steering by idempotency key', async () => {
     await withCwd(async () => {
       await capture(() => ultragoalCommand(['create-goals', '--brief', '- CLI bridge']));
@@ -422,6 +506,7 @@ describe('cli/ultragoal', () => {
     });
   });
 
+  // 小白说明：验证 CLI 不接受宽泛自然语言 steering，避免系统乱猜怎么改 plan；主要覆盖 ultragoalCommand steer 的结构化输入要求。
   it('rejects broad natural-language steering instead of guessing mutations', async () => {
     await withCwd(async () => {
       await capture(() => ultragoalCommand(['create-goals', '--brief', '- CLI bridge']));
@@ -432,6 +517,7 @@ describe('cli/ultragoal', () => {
     });
   });
 
+  // 小白说明：验证旧 JSON proposal 里 kind 非法时会拒绝；主要覆盖 ultragoalCommand steer 的 proposal JSON 解析和 validateUltragoalSteeringProposal。
   it('rejects legacy proposal json with an invalid steering kind', async () => {
     await withCwd(async () => {
       await capture(() => ultragoalCommand(['create-goals', '--brief', '- CLI bridge']));
@@ -452,6 +538,7 @@ describe('cli/ultragoal', () => {
     });
   });
 
+  // 小白说明：验证 steering source 必须合法，合法时审计会记录 source；主要覆盖 ultragoalCommand steer 的 source 校验和审计输出。
   it('rejects invalid steering source and reports the accepted audit source', async () => {
     await withCwd(async () => {
       await capture(() => ultragoalCommand(['create-goals', '--brief', '- CLI bridge']));
@@ -481,6 +568,7 @@ describe('cli/ultragoal', () => {
     });
   });
 
+  // 小白说明：验证 steering 被拒绝时，CLI 会把 rejected 审计结果展示出来；主要覆盖 ultragoalCommand steer 的非 accepted 返回路径。
   it('surfaces rejected structured steering audit results', async () => {
     await withCwd(async () => {
       await capture(() => ultragoalCommand(['create-goals', '--brief', '- CLI bridge']));
@@ -508,6 +596,7 @@ describe('cli/ultragoal', () => {
     });
   });
 
+  // 小白说明：验证 add-goal 命令能追加一个 pending goal 并输出 JSON；主要覆盖 ultragoalCommand 的 add-goal 分支和 addUltragoalGoal。
   it('adds goals through the command surface', async () => {
     await withCwd(async () => {
       await capture(() => ultragoalCommand(['create-goals', '--brief', '- First milestone']));
@@ -527,6 +616,7 @@ describe('cli/ultragoal', () => {
     });
   });
 
+  // 小白说明：验证结构化 flags 能完成 add_subgoal steering mutation；主要覆盖 ultragoalCommand steer flag 解析和 steerUltragoal。
   it('steers an ultragoal mutation through structured flags', async () => {
     await withCwd(async (cwd) => {
       await capture(() => ultragoalCommand(['create-goals', '--brief', '- Add and steer goal']));
@@ -563,6 +653,7 @@ describe('cli/ultragoal', () => {
     });
   });
 
+  // 小白说明：验证 steering 缺少 evidence/rationale 时会报错；主要覆盖 ultragoalCommand steer 的必填参数校验。
   it('errors when missing required steering evidence or rationale', async () => {
     await withCwd(async () => {
       await capture(() => ultragoalCommand(['create-goals', '--brief', '- Add and steer goal']));
@@ -577,6 +668,7 @@ describe('cli/ultragoal', () => {
     });
   });
 
+  // 小白说明：验证 CLI record-review-blockers 能把 final goal 标记为 review_blocked 并追加 resolver；主要覆盖 ultragoalCommand 和 recordFinalReviewBlockers。
   it('records final review blockers through the command surface', async () => {
     await withCwd(async (cwd) => {
       await capture(() => ultragoalCommand(['create-goals', '--brief', '- Final milestone']));
@@ -602,6 +694,7 @@ describe('cli/ultragoal', () => {
     });
   });
 
+  // 小白说明：验证 checkpoint complete 必须带匹配的 complete Codex get_goal 证明；主要覆盖 ultragoalCommand checkpoint 和 checkpointUltragoal 的 reconciliation。
   it('requires matching complete Codex goal proof before completing a checkpoint', async () => {
     await withCwd(async (cwd) => {
       await capture(() => ultragoalCommand(['create-goals', '--brief', '- First milestone']));
@@ -653,6 +746,7 @@ describe('cli/ultragoal', () => {
     });
   });
 
+  // 小白说明：验证 null get_goal 不能完成 checkpoint，也不能误改 progress；主要覆盖 checkpointUltragoal 的 requireSnapshot fail-closed。
   it('rejects null get_goal snapshots for completion without mutating OMX progress', async () => {
     await withCwd(async (cwd) => {
       await capture(() => ultragoalCommand(['create-goals', '--brief', '- First milestone']));
@@ -678,6 +772,7 @@ describe('cli/ultragoal', () => {
     });
   });
 
+  // 小白说明：验证最终质量门禁 JSON 格式坏了时不会完成 goal；主要覆盖 ultragoalCommand checkpoint 的 quality-gate-json 解析错误。
   it('fails closed for malformed final quality-gate json', async () => {
     await withCwd(async (cwd) => {
       await capture(() => ultragoalCommand(['create-goals', '--brief', '- First milestone']));
@@ -698,6 +793,7 @@ describe('cli/ultragoal', () => {
     });
   });
 
+  // 小白说明：验证 legacy completed Codex goal blocker 会记录为非终止 blocked，而不是失败当前 goal；主要覆盖 ultragoalCommand checkpoint --status blocked。
   it('records blocked legacy Codex-goal checkpoints as non-terminal', async () => {
     await withCwd(async (cwd) => {
       await capture(() => ultragoalCommand(['create-goals', '--brief', '- First milestone', '--codex-goal-mode', 'per-story']));
@@ -723,6 +819,7 @@ describe('cli/ultragoal', () => {
     });
   });
 
+  // 小白说明：验证 GHCR 授权问题重复失败后进入 needs_user_decision，并且 retry-failed 不会继续调度；主要覆盖 ultragoalCommand checkpoint/complete-goals 和 checkpointUltragoal 熔断。
   it('circuit-breaks repeated GHCR authorization blockers and skips them on retry-failed', async () => {
     await withCwd(async (cwd) => {
       const ghcrBlocker = [
@@ -782,6 +879,7 @@ describe('cli/ultragoal', () => {
     });
   });
 
+  // 小白说明：验证 blocked checkpoint 不能拿 active 或同 objective Codex goal 绕过保护；主要覆盖 ultragoalCommand checkpoint 和 checkpointUltragoal 的 mismatch 防护。
   it('does not let blocked checkpoints bypass active Codex-goal mismatch protection', async () => {
     await withCwd(async () => {
       await capture(() => ultragoalCommand(['create-goals', '--brief', '- First milestone', '--codex-goal-mode', 'per-story']));

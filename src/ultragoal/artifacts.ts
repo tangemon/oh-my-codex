@@ -1,5 +1,7 @@
+import { randomUUID } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { existsSync } from 'node:fs';
-import { appendFile, mkdir, open, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { join, relative } from 'node:path';
 import {
   formatCodexGoalReconciliation,
@@ -19,6 +21,8 @@ export const ULTRAGOAL_BRIEF = 'brief.md';
 export const ULTRAGOAL_GOALS = 'goals.json';
 export const ULTRAGOAL_LEDGER = 'ledger.jsonl';
 const ULTRAGOAL_MUTATION_LOCK = '.mutation.lock';
+const ULTRAGOAL_MUTATION_LOCK_STALE_MS = 5 * 60_000;
+const ultragoalMutationLockContext = new AsyncLocalStorage<{ lockPath: string; token: string }>();
 
 export type UltragoalStatus = 'pending' | 'in_progress' | 'complete' | 'failed' | 'review_blocked' | 'needs_user_decision';
 export type UltragoalCodexGoalMode = 'aggregate' | 'per_story';
@@ -806,14 +810,18 @@ async function withUltragoalMutationLock<T>(cwd: string, operation: () => Promis
   await mkdir(ultragoalDir(cwd), { recursive: true });
   const lockPath = join(ultragoalDir(cwd), ULTRAGOAL_MUTATION_LOCK);
   let handle: Awaited<ReturnType<typeof open>> | undefined;
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+  let lockToken: string | undefined;
+  const maxAttempts = readUltragoalMutationLockMaxAttempts();
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     try {
       handle = await open(lockPath, 'wx');
-      await handle.writeFile(JSON.stringify({ pid: process.pid, createdAt: iso() }));
+      lockToken = randomUUID();
+      await handle.writeFile(JSON.stringify({ pid: process.pid, createdAt: iso(), token: lockToken }));
       break;
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== 'EEXIST') throw error;
+      if (await recoverStaleUltragoalMutationLock(lockPath)) continue;
       await sleep(Math.min(25 + attempt * 5, 250));
     }
   }
@@ -821,14 +829,89 @@ async function withUltragoalMutationLock<T>(cwd: string, operation: () => Promis
     throw new UltragoalError(`Timed out waiting for ultragoal mutation lock at ${repoRelative(cwd, lockPath)}.`);
   }
   try {
-    return await operation();
+    if (!lockToken) throw new UltragoalError(`Acquired ultragoal mutation lock at ${repoRelative(cwd, lockPath)} without an ownership token.`);
+    return await ultragoalMutationLockContext.run({ lockPath, token: lockToken }, operation);
   } finally {
     await handle.close().catch(() => undefined);
-    await rm(lockPath, { force: true }).catch(() => undefined);
+    if (lockToken) {
+      const currentToken = await readUltragoalLockToken(lockPath).catch(() => undefined);
+      if (currentToken === lockToken) await rm(lockPath, { force: true }).catch(() => undefined);
+    }
+  }
+}
+
+async function assertCurrentUltragoalMutationLock(cwd: string): Promise<void> {
+  const lockPath = join(ultragoalDir(cwd), ULTRAGOAL_MUTATION_LOCK);
+  const context = ultragoalMutationLockContext.getStore();
+  if (!context || context.lockPath !== lockPath) {
+    throw new UltragoalError(`Refusing to write ${ULTRAGOAL_DIR} without the ultragoal mutation lock.`);
+  }
+  const currentToken = await readUltragoalLockToken(lockPath).catch(() => undefined);
+  if (currentToken !== context.token) {
+    throw new UltragoalError(`Lost ultragoal mutation lock ownership at ${repoRelative(cwd, lockPath)}.`);
+  }
+}
+
+function readUltragoalMutationLockMaxAttempts(): number {
+  const parsed = Number.parseInt(process.env.OMX_ULTRAGOAL_MUTATION_LOCK_MAX_ATTEMPTS ?? '', 10);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.min(Math.floor(parsed), 1000) : 100;
+}
+
+function isPidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+function parseLockRecord(raw: string): { pid?: number; createdAt?: string; token?: string } | null {
+  try {
+    const parsed = JSON.parse(raw) as { pid?: unknown; createdAt?: unknown; token?: unknown };
+    return {
+      pid: typeof parsed.pid === 'number' ? parsed.pid : undefined,
+      createdAt: typeof parsed.createdAt === 'string' ? parsed.createdAt : undefined,
+      token: typeof parsed.token === 'string' ? parsed.token : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function readUltragoalLockToken(lockPath: string): Promise<string | undefined> {
+  return parseLockRecord(await readFile(lockPath, 'utf-8'))?.token;
+}
+
+async function recoverStaleUltragoalMutationLock(lockPath: string): Promise<boolean> {
+  const raw = await readFile(lockPath, 'utf-8').catch(() => '');
+  const record = parseLockRecord(raw);
+  const createdAtMs = record?.createdAt ? Date.parse(record.createdAt) : NaN;
+  const lockStats = await stat(lockPath).catch(() => null);
+  if (!lockStats) return true;
+  const fileAgeMs = Date.now() - lockStats.mtimeMs;
+  const malformedOrUnstamped = !record || !Number.isFinite(createdAtMs);
+  const staleByAge = malformedOrUnstamped
+    ? fileAgeMs > ULTRAGOAL_MUTATION_LOCK_STALE_MS
+    : Date.now() - createdAtMs > ULTRAGOAL_MUTATION_LOCK_STALE_MS;
+  const staleByPid = record?.pid !== undefined && !isPidAlive(record.pid);
+  if (record?.pid !== undefined && isPidAlive(record.pid)) return false;
+  if (!staleByAge && !staleByPid) return false;
+
+  const stalePath = `${lockPath}.${process.pid}.${Date.now()}.${randomUUID()}.stale`;
+  try {
+    await rename(lockPath, stalePath);
+    await rm(stalePath, { force: true });
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
+    return false;
   }
 }
 
 async function appendLedger(cwd: string, entry: UltragoalLedgerEntry): Promise<void> {
+  await assertCurrentUltragoalMutationLock(cwd);
   await mkdir(ultragoalDir(cwd), { recursive: true });
   const path = ultragoalLedgerPath(cwd);
   await appendFile(path, `${JSON.stringify(entry)}\n`);
@@ -846,25 +929,38 @@ export async function readUltragoalPlan(cwd: string): Promise<UltragoalPlan> {
   if (parsed.version !== 1 || !Array.isArray(parsed.goals)) {
     throw new UltragoalError(`Invalid ultragoal plan at ${repoRelative(cwd, path)}.`);
   }
-  if (codexGoalMode(parsed) === 'aggregate' && isLegacyEnumeratedAggregateObjective(parsed.codexObjective)) {
-    const previousObjective = parsed.codexObjective;
-    const now = iso();
-    parsed.codexObjective = aggregateCodexObjective(parsed.goals);
-    parsed.codexObjectiveAliases = Array.from(new Set([...(parsed.codexObjectiveAliases ?? []), previousObjective].filter((value): value is string => typeof value === 'string' && value.length > 0)));
-    parsed.updatedAt = now;
-    await writePlan(cwd, parsed);
+  return parsed;
+}
+
+function migrateLegacyAggregateObjectiveInMemory(plan: UltragoalPlan, now: string): { migrated: boolean; previousObjective?: string } {
+  if (codexGoalMode(plan) !== 'aggregate' || !isLegacyEnumeratedAggregateObjective(plan.codexObjective)) {
+    return { migrated: false };
+  }
+  const previousObjective = plan.codexObjective;
+  plan.codexObjective = aggregateCodexObjective(plan.goals);
+  plan.codexObjectiveAliases = Array.from(new Set([...(plan.codexObjectiveAliases ?? []), previousObjective].filter((value): value is string => typeof value === 'string' && value.length > 0)));
+  plan.updatedAt = now;
+  return { migrated: true, previousObjective };
+}
+
+async function readUltragoalPlanForMutation(cwd: string, now = iso()): Promise<UltragoalPlan> {
+  const plan = await readUltragoalPlan(cwd);
+  const migration = migrateLegacyAggregateObjectiveInMemory(plan, now);
+  if (migration.migrated) {
+    await writePlan(cwd, plan);
     await appendLedger(cwd, {
       ts: now,
       event: 'aggregate_objective_migrated',
       message: 'Migrated legacy enumerated aggregate Codex objective to the stable pointer objective.',
-      before: { codexObjective: previousObjective },
-      after: { codexObjective: parsed.codexObjective },
+      before: { codexObjective: migration.previousObjective },
+      after: { codexObjective: plan.codexObjective },
     });
   }
-  return parsed;
+  return plan;
 }
 
 async function writePlan(cwd: string, plan: UltragoalPlan): Promise<void> {
+  await assertCurrentUltragoalMutationLock(cwd);
   await mkdir(ultragoalDir(cwd), { recursive: true });
   const path = ultragoalGoalsPath(cwd);
   const tmpPath = `${path}.${process.pid}.${Date.now()}.tmp`;
@@ -980,8 +1076,8 @@ function appendGoalToPlan(plan: UltragoalPlan, options: AddUltragoalGoalOptions 
 
 export async function addUltragoalGoal(cwd: string, options: AddUltragoalGoalOptions): Promise<{ plan: UltragoalPlan; goal: UltragoalItem }> {
   return withUltragoalMutationLock(cwd, async () => {
-  const plan = await readUltragoalPlan(cwd);
   const now = iso(options.now);
+  const plan = await readUltragoalPlanForMutation(cwd, now);
   const goal = appendGoalToPlan(plan, options);
   await writePlan(cwd, plan);
   await appendLedger(cwd, {
@@ -1263,7 +1359,8 @@ function applySteeringMutation(plan: UltragoalPlan, proposal: UltragoalSteeringP
 
 export async function steerUltragoal(cwd: string, proposal: UltragoalSteeringProposal, options: { now?: Date; directiveText?: string } = {}): Promise<SteerUltragoalResult> {
   return withUltragoalMutationLock(cwd, async () => {
-  const plan = await readUltragoalPlan(cwd);
+  const now = iso(options.now ?? proposal.now);
+  const plan = await readUltragoalPlanForMutation(cwd, now);
   const existing = proposal.idempotencyKey
     ? (await readSteeringLedgerEntries(cwd)).find((entry) => entry.event === 'steering_accepted' && (entry.idempotencyKey === proposal.idempotencyKey || entry.steering?.idempotencyKey === proposal.idempotencyKey) && entry.steering)
     : undefined;
@@ -1272,7 +1369,6 @@ export async function steerUltragoal(cwd: string, proposal: UltragoalSteeringPro
   }
 
   let invariant = validateUltragoalSteeringProposal(plan, proposal);
-  const now = iso(options.now ?? proposal.now);
   const beforePlan = cloneForAudit(plan);
   let mutation: { before?: unknown; after?: unknown } = {};
   if (invariant.accepted) {
@@ -1536,8 +1632,8 @@ function validateQualityGate(value: unknown, requiredInvariants: readonly Requir
 
 export async function startNextUltragoal(cwd: string, options: StartNextOptions = {}): Promise<{ plan: UltragoalPlan; goal: UltragoalItem | null; resumed: boolean; done: boolean }> {
   return withUltragoalMutationLock(cwd, async () => {
-  const plan = await readUltragoalPlan(cwd);
   const now = iso(options.now);
+  const plan = await readUltragoalPlanForMutation(cwd, now);
   if (plan.aggregateCompletion?.status === 'complete') return { plan, goal: null, resumed: false, done: true };
   const existing = plan.goals.find((goal) => goal.status === 'in_progress' && isScheduleEligibleGoal(goal));
   if (existing) {
@@ -1569,10 +1665,10 @@ export async function startNextUltragoal(cwd: string, options: StartNextOptions 
 
 export async function checkpointUltragoal(cwd: string, options: CheckpointOptions): Promise<UltragoalPlan> {
   return withUltragoalMutationLock(cwd, async () => {
-  const plan = await readUltragoalPlan(cwd);
+  const now = iso(options.now);
+  const plan = await readUltragoalPlanForMutation(cwd, now);
   const goal = plan.goals.find((candidate) => candidate.id === options.goalId);
   if (!goal) throw new UltragoalError(`Unknown ultragoal id: ${options.goalId}`);
-  const now = iso(options.now);
   if (options.status === 'blocked') {
     if (goal.status !== 'in_progress') {
       throw new UltragoalError(`Cannot record a blocked checkpoint for ${goal.id} while it is ${goal.status}; start or resume the ultragoal before recording a non-terminal blocker.`);
@@ -1836,7 +1932,8 @@ export async function checkpointUltragoal(cwd: string, options: CheckpointOption
 
 export async function recordFinalReviewBlockers(cwd: string, options: RecordFinalReviewBlockersOptions): Promise<{ plan: UltragoalPlan; blockedGoal: UltragoalItem; addedGoal: UltragoalItem }> {
   return withUltragoalMutationLock(cwd, async () => {
-  const plan = await readUltragoalPlan(cwd);
+  const now = iso(options.now);
+  const plan = await readUltragoalPlanForMutation(cwd, now);
   const goal = plan.goals.find((candidate) => candidate.id === options.goalId);
   if (!goal) throw new UltragoalError(`Unknown ultragoal id: ${options.goalId}`);
   assertNonEmpty(options.evidence, '--evidence');
@@ -1847,7 +1944,6 @@ export async function recordFinalReviewBlockers(cwd: string, options: RecordFina
     throw new UltragoalError(`Cannot record final review blockers for ${goal.id}; it is not the only unresolved ultragoal story.`);
   }
 
-  const now = iso(options.now);
   const expectedObjective = expectedCodexObjective(plan, goal);
   const aggregateMode = codexGoalMode(plan) === 'aggregate';
   const reconciliation = reconcileCodexGoalSnapshot(

@@ -46,6 +46,7 @@ import { WIKI_SCHEMA_VERSION } from "../../wiki/types.js";
 import {
 	createUltragoalPlan,
 	readUltragoalPlan,
+	startNextUltragoal,
 } from "../../ultragoal/artifacts.js";
 import { getBaseStateDir } from "../../state/paths.js";
 import { maybeNudgeLeaderForAllowedWorkerStop } from "../notify-hook/team-worker-stop.js";
@@ -8558,6 +8559,237 @@ standardMaxRounds = 15
 			assert.equal(
 				(ledger.match(/"event":"steering_rejected"/g) ?? []).length,
 				0,
+			);
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("does not apply UserPromptSubmit ultragoal steering when native subagent tracking is corrupt", async () => {
+		const cwd = await mkdtemp(
+			join(tmpdir(), "omx-native-hook-ultragoal-steer-corrupt-tracker-"),
+		);
+		try {
+			await createUltragoalPlan(cwd, {
+				brief:
+					"G002-cli-and-prompt-submit-bridge .omx/ultragoal corrupt tracker steering fixture",
+				goals: [
+					{ title: "First", objective: "Complete first milestone with tests." },
+				],
+			});
+			const stateDir = join(cwd, ".omx", "state");
+			await writeJson(join(stateDir, "session.json"), {
+				session_id: "sess-ultragoal-parent",
+				native_session_id: "native-ultragoal-parent",
+			});
+			await writeFile(join(stateDir, "subagent-tracking.json"), "{not valid json", "utf-8");
+
+			const result = await dispatchCodexNativeHook(
+				{
+					hook_event_name: "UserPromptSubmit",
+					cwd,
+					session_id: "native-ultragoal-child",
+					thread_id: "native-ultragoal-child",
+					turn_id: "turn-ultragoal-child-corrupt-tracker",
+					prompt: `OMX_ULTRAGOAL_STEER: ${JSON.stringify({
+						kind: "add_subgoal",
+						source: "user_prompt_submit",
+						evidence: "Corrupt tracker must not let child prompt mutate parent ultragoal.",
+						rationale:
+							"Subagent classification must fail closed when tracking is unreadable.",
+						title: "Corrupt tracker should not add this",
+						objective: "This must remain literal prompt text.",
+					})}`,
+				},
+				{ cwd },
+			);
+
+			assert.equal(result.outputJson, null);
+			const plan = await readUltragoalPlan(cwd);
+			assert.equal(plan.goals.length, 1);
+			const ledger = await readFile(
+				join(cwd, ".omx/ultragoal/ledger.jsonl"),
+				"utf-8",
+			);
+			assert.equal(
+				(ledger.match(/"event":"steering_accepted"/g) ?? []).length,
+				0,
+			);
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("does not apply UserPromptSubmit ultragoal steering from Team worker prompts", async () => {
+		const cwd = await mkdtemp(
+			join(tmpdir(), "omx-native-hook-ultragoal-steer-team-worker-"),
+		);
+		const previousWorker = process.env.OMX_TEAM_WORKER;
+		try {
+			process.env.OMX_TEAM_WORKER = "team-a/worker-1";
+			await createUltragoalPlan(cwd, {
+				brief:
+					"G002-cli-and-prompt-submit-bridge .omx/ultragoal team-worker steering fixture",
+				goals: [
+					{ title: "First", objective: "Complete first milestone with tests." },
+				],
+			});
+
+			const result = await dispatchCodexNativeHook(
+				{
+					hook_event_name: "UserPromptSubmit",
+					cwd,
+					session_id: "sess-team-worker-steer",
+					thread_id: "thread-team-worker-steer",
+					turn_id: "turn-team-worker-steer",
+					prompt: `OMX_ULTRAGOAL_STEER: ${JSON.stringify({
+						kind: "add_subgoal",
+						source: "user_prompt_submit",
+						evidence: "Team worker prompt must not mutate leader-owned .omx/ultragoal.",
+						rationale:
+							"Team workers report evidence upward; the leader owns checkpointing.",
+						title: "Team worker should not add this",
+						objective: "This must remain worker prompt text.",
+					})}`,
+				},
+				{ cwd },
+			);
+
+			assert.equal(result.outputJson, null);
+			const plan = await readUltragoalPlan(cwd);
+			assert.equal(plan.goals.length, 1);
+			const ledger = await readFile(
+				join(cwd, ".omx/ultragoal/ledger.jsonl"),
+				"utf-8",
+			);
+			assert.equal(
+				(ledger.match(/"event":"steering_accepted"/g) ?? []).length,
+				0,
+			);
+		} finally {
+			if (typeof previousWorker === "string") process.env.OMX_TEAM_WORKER = previousWorker;
+			else delete process.env.OMX_TEAM_WORKER;
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("does not run parent ultragoal goal reconciliation on native subagent Stop", async () => {
+		const cwd = await mkdtemp(
+			join(tmpdir(), "omx-native-hook-ultragoal-stop-subagent-"),
+		);
+		try {
+			await createUltragoalPlan(cwd, {
+				brief: "Parent ultragoal should not capture child Stop hooks.",
+				goals: [
+					{ title: "First", objective: "Complete first milestone with tests." },
+				],
+			});
+			await startNextUltragoal(cwd);
+			const stateDir = join(cwd, ".omx", "state");
+			const canonicalSessionId = "sess-ultragoal-stop-parent";
+			const leaderNativeSessionId = "native-ultragoal-stop-parent";
+			const childNativeSessionId = "native-ultragoal-stop-child";
+			const nowIso = new Date().toISOString();
+			await writeJson(join(stateDir, "session.json"), {
+				session_id: canonicalSessionId,
+				native_session_id: leaderNativeSessionId,
+			});
+			await writeJson(join(stateDir, "subagent-tracking.json"), {
+				schemaVersion: 1,
+				sessions: {
+					[canonicalSessionId]: {
+						session_id: canonicalSessionId,
+						leader_thread_id: leaderNativeSessionId,
+						updated_at: nowIso,
+						threads: {
+							[leaderNativeSessionId]: {
+								thread_id: leaderNativeSessionId,
+								kind: "leader",
+								first_seen_at: nowIso,
+								last_seen_at: nowIso,
+								turn_count: 1,
+							},
+							[childNativeSessionId]: {
+								thread_id: childNativeSessionId,
+								kind: "subagent",
+								first_seen_at: nowIso,
+								last_seen_at: nowIso,
+								turn_count: 1,
+								mode: "executor",
+							},
+						},
+					},
+				},
+			});
+
+			const result = await dispatchCodexNativeHook(
+				{
+					hook_event_name: "Stop",
+					cwd,
+					session_id: childNativeSessionId,
+					thread_id: childNativeSessionId,
+					turn_id: "turn-ultragoal-stop-child",
+					last_assistant_message:
+						"The child task is complete; parent ultragoal checkpoint evidence was reported upward.",
+				},
+				{ cwd },
+			);
+
+			assert.notEqual(
+				result.outputJson?.stopReason,
+				"ultragoal_codex_goal_snapshot_required",
+			);
+			assert.doesNotMatch(
+				String(result.outputJson?.systemMessage ?? result.outputJson?.reason ?? ""),
+				/omx ultragoal checkpoint/i,
+			);
+			assert.equal(
+				existsSync(join(stateDir, "native-stop-state.json")),
+				false,
+				"native subagent Stop must not write parent/session native-stop-state",
+			);
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("does not run parent Stop handling when native subagent tracking is corrupt", async () => {
+		const cwd = await mkdtemp(
+			join(tmpdir(), "omx-native-hook-ultragoal-stop-corrupt-tracker-"),
+		);
+		try {
+			await createUltragoalPlan(cwd, {
+				brief: "Corrupt tracking should not capture child Stop hooks.",
+				goals: [
+					{ title: "First", objective: "Complete first milestone with tests." },
+				],
+			});
+			await startNextUltragoal(cwd);
+			const stateDir = join(cwd, ".omx", "state");
+			await writeJson(join(stateDir, "session.json"), {
+				session_id: "sess-ultragoal-stop-parent",
+				native_session_id: "native-ultragoal-stop-parent",
+			});
+			await writeFile(join(stateDir, "subagent-tracking.json"), "{not valid json", "utf-8");
+
+			const result = await dispatchCodexNativeHook(
+				{
+					hook_event_name: "Stop",
+					cwd,
+					session_id: "native-ultragoal-stop-child",
+					thread_id: "native-ultragoal-stop-child",
+					turn_id: "turn-ultragoal-stop-child-corrupt-tracker",
+					last_assistant_message:
+						"The child task is complete; parent ultragoal checkpoint evidence was reported upward.",
+				},
+				{ cwd },
+			);
+
+			assert.equal(result.outputJson, null);
+			assert.equal(
+				existsSync(join(stateDir, "native-stop-state.json")),
+				false,
+				"corrupt tracker child-shaped Stop must not write parent/session native-stop-state",
 			);
 		} finally {
 			await rm(cwd, { recursive: true, force: true });

@@ -26,6 +26,7 @@ import {
   recordSubagentTurn,
   recordSubagentTurnForSession,
   resolveInstalledRoleName,
+  withCrossProcessFileLockSync,
 } from "../subagents/tracker.js";
 import {
   bindAndPublishAdaptedRole,
@@ -655,8 +656,11 @@ async function isNativeSubagentHook(
   // quoted review context.  Fall back to the global tracking index so any known
   // subagent thread is treated as subagent-scoped, regardless of the current
   // hook payload's session-id mapping.
-  const trackingState = await readSubagentTrackingState(cwd).catch(() => null);
-  if (!trackingState) return false;
+  const trackingRead = await readSubagentTrackingStateStrict(cwd);
+  if (!trackingRead.ok) {
+    return candidateIds.some((id) => !currentLeaderIds.has(id));
+  }
+  const trackingState = trackingRead.state;
 
   return Object.values(trackingState.sessions).some((session) => (
     candidateIds.some((id) => isTrustedSubagentThread(session, id))
@@ -1005,6 +1009,15 @@ async function readJsonIfExists(path: string): Promise<Record<string, unknown> |
   if (!existsSync(path)) return null;
   try {
     return JSON.parse(await readFile(path, "utf-8")) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function readJsonIfExistsSync(path: string): Record<string, unknown> | null {
+  if (!existsSync(path)) return null;
+  try {
+    return JSON.parse(readFileSync(path, "utf-8")) as Record<string, unknown>;
   } catch {
     return null;
   }
@@ -8834,26 +8847,29 @@ async function clearNativeStopSessionEntries(
   canonicalSessionId?: string,
 ): Promise<void> {
   const statePath = join(stateDir, NATIVE_STOP_STATE_FILE);
-  const state = await readJsonIfExists(statePath);
-  if (!state) return;
+  withCrossProcessFileLockSync(statePath, (context) => {
+    const state = readJsonIfExistsSync(statePath);
+    if (!state) return;
 
-  const sessions = safeObject(state.sessions);
-  const keys = new Set(uniqueNonEmpty([
-    readNativeStopSessionKey(payload, canonicalSessionId),
-    canonicalSessionId,
-    readPayloadSessionId(payload),
-    readPayloadThreadId(payload),
-  ]));
-  let changed = false;
-  for (const key of keys) {
-    if (Object.prototype.hasOwnProperty.call(sessions, key)) {
-      delete sessions[key];
-      changed = true;
+    const sessions = safeObject(state.sessions);
+    const keys = new Set(uniqueNonEmpty([
+      readNativeStopSessionKey(payload, canonicalSessionId),
+      canonicalSessionId,
+      readPayloadSessionId(payload),
+      readPayloadThreadId(payload),
+    ]));
+    let changed = false;
+    for (const key of keys) {
+      if (Object.prototype.hasOwnProperty.call(sessions, key)) {
+        delete sessions[key];
+        changed = true;
+      }
     }
-  }
-  if (!changed) return;
+    if (!changed) return;
 
-  await writeFile(statePath, JSON.stringify({ ...state, sessions }, null, 2));
+    context.assertOwnership();
+    context.publish(JSON.stringify({ ...state, sessions }, null, 2));
+  });
 }
 
 async function hasAuthoritativeInactiveSkillStopState(
@@ -9408,35 +9424,38 @@ async function maybeBuildOrdinaryStopNoProgressOutput(
   if (!lastAssistantMessage) return null;
 
   const statePath = join(stateDir, NATIVE_STOP_STATE_FILE);
-  const state = await readJsonIfExists(statePath) ?? {};
-  const sessions = safeObject(state.sessions);
-  const sessionKey = readNativeStopSessionKey(payload, canonicalSessionId);
-  const sessionState = safeObject(sessions[sessionKey]);
-  const previousGuard = safeObject(sessionState.ordinary_no_progress_guard);
   const fingerprint = ordinaryStopProgressFingerprint(payload);
-  const nowIso = new Date().toISOString();
-  const previousFingerprint = safeString(previousGuard.fingerprint).trim();
-  const sameFingerprint = previousFingerprint === fingerprint;
-  const firstSeenAt = sameFingerprint
-    ? safeString(previousGuard.first_seen_at).trim() || nowIso
-    : nowIso;
-  const repeatCount = sameFingerprint
-    ? parseBoundedPositiveInteger(previousGuard.repeat_count, 1) + 1
-    : 1;
+  const guard = withCrossProcessFileLockSync(statePath, (context) => {
+    const state = readJsonIfExistsSync(statePath) ?? {};
+    const sessions = safeObject(state.sessions);
+    const sessionKey = readNativeStopSessionKey(payload, canonicalSessionId);
+    const sessionState = safeObject(sessions[sessionKey]);
+    const previousGuard = safeObject(sessionState.ordinary_no_progress_guard);
+    const nowIso = new Date().toISOString();
+    const previousFingerprint = safeString(previousGuard.fingerprint).trim();
+    const sameFingerprint = previousFingerprint === fingerprint;
+    const firstSeenAt = sameFingerprint
+      ? safeString(previousGuard.first_seen_at).trim() || nowIso
+      : nowIso;
+    const repeatCount = sameFingerprint
+      ? parseBoundedPositiveInteger(previousGuard.repeat_count, 1) + 1
+      : 1;
 
-  sessions[sessionKey] = {
-    ...sessionState,
-    ordinary_no_progress_guard: {
-      fingerprint,
-      first_seen_at: firstSeenAt,
-      last_seen_at: nowIso,
-      repeat_count: repeatCount,
-      last_turn_id: readPayloadTurnId(payload) || null,
-      last_thread_id: readPayloadThreadId(payload) || null,
-    },
-  };
-  await mkdir(stateDir, { recursive: true });
-  await writeFile(statePath, JSON.stringify({ ...state, sessions }, null, 2));
+    sessions[sessionKey] = {
+      ...sessionState,
+      ordinary_no_progress_guard: {
+        fingerprint,
+        first_seen_at: firstSeenAt,
+        last_seen_at: nowIso,
+        repeat_count: repeatCount,
+        last_turn_id: readPayloadTurnId(payload) || null,
+        last_thread_id: readPayloadThreadId(payload) || null,
+      },
+    };
+    context.assertOwnership();
+    context.publish(JSON.stringify({ ...state, sessions }, null, 2));
+    return { firstSeenAt, repeatCount };
+  });
 
   const maxRepeats = parseBoundedPositiveInteger(
     process.env.OMX_NATIVE_STOP_NO_PROGRESS_MAX_REPEATS,
@@ -9446,16 +9465,16 @@ async function maybeBuildOrdinaryStopNoProgressOutput(
     process.env.OMX_NATIVE_STOP_NO_PROGRESS_IDLE_MS,
     ORDINARY_STOP_NO_PROGRESS_DEFAULT_IDLE_MS,
   );
-  const firstSeenMs = readIsoTimeMs(firstSeenAt) ?? Date.now();
+  const firstSeenMs = readIsoTimeMs(guard.firstSeenAt) ?? Date.now();
   const elapsedMs = Math.max(0, Date.now() - firstSeenMs);
-  if (repeatCount < maxRepeats || elapsedMs < idleMs) return null;
+  if (guard.repeatCount < maxRepeats || elapsedMs < idleMs) return null;
 
   const message = shortenOrdinaryStopProgressText(
     safeString(payload.last_assistant_message ?? payload.lastAssistantMessage) || "no assistant message recorded",
   );
   const elapsedSeconds = Math.round(elapsedMs / 1000);
   const diagnostic =
-    `OMX ordinary task no-progress guard triggered after ${repeatCount} repeated Stop-hook pass(es) over ~${elapsedSeconds}s with unchanged status: "${message}". ` +
+    `OMX ordinary task no-progress guard triggered after ${guard.repeatCount} repeated Stop-hook pass(es) over ~${elapsedSeconds}s with unchanged status: "${message}". ` +
     "Emit a concise diagnostic summary now: state the last concrete progress/evidence, whether the task is complete, blocked, failed, or needs missing information, and stop instead of continuing a vague working loop.";
 
   return {
@@ -9474,19 +9493,21 @@ async function persistNativeStopSignature(
 ): Promise<void> {
   if (!signature) return;
   const statePath = join(stateDir, NATIVE_STOP_STATE_FILE);
-  const state = await readJsonIfExists(statePath) ?? {};
-  const sessions = safeObject(state.sessions);
-  const sessionKey = readNativeStopSessionKey(payload, canonicalSessionId);
-  sessions[sessionKey] = {
-    ...safeObject(sessions[sessionKey]),
-    last_signature: signature,
-    updated_at: new Date().toISOString(),
-  };
-  await mkdir(stateDir, { recursive: true });
-  await writeFile(statePath, JSON.stringify({
-    ...state,
-    sessions,
-  }, null, 2));
+  withCrossProcessFileLockSync(statePath, (context) => {
+    const state = readJsonIfExistsSync(statePath) ?? {};
+    const sessions = safeObject(state.sessions);
+    const sessionKey = readNativeStopSessionKey(payload, canonicalSessionId);
+    sessions[sessionKey] = {
+      ...safeObject(sessions[sessionKey]),
+      last_signature: signature,
+      updated_at: new Date().toISOString(),
+    };
+    context.assertOwnership();
+    context.publish(JSON.stringify({
+      ...state,
+      sessions,
+    }, null, 2));
+  });
 }
 
 async function maybeReturnRepeatableStopOutput(
@@ -9772,7 +9793,7 @@ async function buildStopHookOutput(
   payload: CodexHookPayload,
   cwd: string,
   stateDir: string,
-  options: { skipAutoNudge?: boolean; skipRalphStopBlock?: boolean; canonicalSessionId?: string } = {},
+  options: { skipAutoNudge?: boolean; skipRalphStopBlock?: boolean; skipGoalWorkflowReconciliation?: boolean; canonicalSessionId?: string } = {},
 ): Promise<Record<string, unknown> | null> {
   if (isStopExempt(payload)) {
     return null;
@@ -9992,7 +10013,9 @@ async function buildStopHookOutput(
     const lastAssistantMessage = safeString(
       payload.last_assistant_message ?? payload.lastAssistantMessage,
     );
-    const goalWorkflowStopOutput = await buildGoalWorkflowReconciliationStopOutput(payload, cwd);
+    const goalWorkflowStopOutput = options.skipGoalWorkflowReconciliation === true
+      ? null
+      : await buildGoalWorkflowReconciliationStopOutput(payload, cwd);
     if (goalWorkflowStopOutput) {
       return await returnPersistentStopBlock(
         payload,
@@ -10370,7 +10393,7 @@ export async function dispatchCodexNativeHook(
       ? await buildCompletedGoalCleanupPromptWarning(cwd, prompt).catch(() => null)
         ?? await buildGoalWorkflowReconciliationPromptWarning(cwd, prompt).catch(() => null)
       : null;
-    ultragoalSteeringAdditionalContext = prompt && !isSubagentPromptSubmit && allowImplicitSessionSideEffects && allowPromptGlobalSideEffects
+    ultragoalSteeringAdditionalContext = prompt && !isSubagentPromptSubmit && !hasTeamWorkerEnvironment() && allowImplicitSessionSideEffects && allowPromptGlobalSideEffects
       ? await applyUserPromptUltragoalSteering(cwd, prompt).catch((error) => `OMX native UserPromptSubmit rejected bounded .omx/ultragoal steering for G002-cli-and-prompt-submit-bridge: ${error instanceof Error ? error.message : String(error)}`)
       : null;
     let suppressActivationSeeding = !allowImplicitSessionSideEffects;
@@ -10642,11 +10665,11 @@ export async function dispatchCodexNativeHook(
     outputJson = buildNativePostToolUseOutput(payload);
   } else if (hookEventName === "Stop") {
     if (allowImplicitSessionSideEffects) {
-      outputJson = await buildStopHookOutput(payload, cwd, stateDir, {
-        canonicalSessionId: canonicalSessionId || undefined,
-        skipRalphStopBlock: isSubagentStop,
-        skipAutoNudge: isSubagentStop,
-      }) ?? await buildCompletedGoalCleanupStopOutput(payload, cwd);
+      outputJson = isSubagentStop
+        ? null
+        : await buildStopHookOutput(payload, cwd, stateDir, {
+          canonicalSessionId: canonicalSessionId || undefined,
+        }) ?? await buildCompletedGoalCleanupStopOutput(payload, cwd);
     } else {
       const failure = stopAuthorizationFailure ?? {
         stopReason: "session_pointer_unusable",

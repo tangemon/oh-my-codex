@@ -13,6 +13,7 @@ import {
 } from '../leader/contract.js';
 import { resolveRuntimeStateScope } from '../mcp/state-paths.js';
 import { readRoleRoutingMarker } from '../subagents/role-routing-marker.js';
+import { isTrustedSubagentThread, readSubagentTrackingStateStrict } from '../subagents/tracker.js';
 import {
   addUltragoalGoal,
   buildCodexGoalInstruction,
@@ -344,14 +345,66 @@ function readTeamWorkerIdentity(env: NodeJS.ProcessEnv = process.env): string | 
   return internalIdentity || null;
 }
 
-function assertUltragoalMutationAllowedFromCurrentProcess(command: string): void {
+function readNativeSubagentEnvironmentIdentity(env: NodeJS.ProcessEnv = process.env): string | null {
+  const direct = [
+    env.OMX_NATIVE_SUBAGENT,
+    env.OMX_NATIVE_SUBAGENT_ID,
+    env.CODEX_NATIVE_SUBAGENT,
+    env.CODEX_SUBAGENT_ID,
+  ].map((value) => typeof value === 'string' ? value.trim() : '').find(Boolean);
+  if (direct) return direct;
+
+  const threadId = [
+    env.OMX_NATIVE_THREAD_ID,
+    env.OMX_THREAD_ID,
+    env.CODEX_THREAD_ID,
+  ].map((value) => typeof value === 'string' ? value.trim() : '').find(Boolean);
+  const parentThreadId = [
+    env.OMX_PARENT_THREAD_ID,
+    env.CODEX_PARENT_THREAD_ID,
+  ].map((value) => typeof value === 'string' ? value.trim() : '').find(Boolean);
+  return threadId && parentThreadId && threadId !== parentThreadId ? threadId : null;
+}
+
+async function readTrackedNativeSubagentCliIdentity(cwd: string, env: NodeJS.ProcessEnv = process.env): Promise<string | null> {
+  const threadId = [
+    env.OMX_NATIVE_THREAD_ID,
+    env.OMX_THREAD_ID,
+    env.CODEX_THREAD_ID,
+  ].map((value) => typeof value === 'string' ? value.trim() : '').find(Boolean);
+  if (!threadId) return null;
+  const read = await readSubagentTrackingStateStrict(cwd);
+  if (!read.ok) {
+    throw new UltragoalError(
+      'Refusing mutating ultragoal command because native subagent tracking is unreadable. '
+      + 'Ultragoal state is leader-owned; repair .omx/state/subagent-tracking.json before mutating .omx/ultragoal.',
+    );
+  }
+  const state = read.state;
+  for (const session of Object.values(state.sessions)) {
+    const tracked = session.threads[threadId];
+    if (tracked?.kind === 'subagent' || isTrustedSubagentThread(session, threadId)) return threadId;
+  }
+  return null;
+}
+
+async function assertUltragoalMutationAllowedFromCurrentProcess(command: string, cwd: string): Promise<void> {
   if (!ULTRAGOAL_MUTATING_COMMANDS.has(command)) return;
   const workerIdentity = readTeamWorkerIdentity();
-  if (!workerIdentity) return;
-  throw new UltragoalError(
-    `Refusing mutating ultragoal command "${command}" from Team worker ${workerIdentity}. `
-    + 'Ultragoal state is leader-owned; workers must report checkpoint evidence upward instead of mutating .omx/ultragoal.',
-  );
+  if (workerIdentity) {
+    throw new UltragoalError(
+      `Refusing mutating ultragoal command "${command}" from Team worker ${workerIdentity}. `
+      + 'Ultragoal state is leader-owned; workers must report checkpoint evidence upward instead of mutating .omx/ultragoal.',
+    );
+  }
+  const nativeSubagentIdentity = readNativeSubagentEnvironmentIdentity()
+    ?? await readTrackedNativeSubagentCliIdentity(cwd);
+  if (nativeSubagentIdentity) {
+    throw new UltragoalError(
+      `Refusing mutating ultragoal command "${command}" from native subagent ${nativeSubagentIdentity}. `
+      + 'Ultragoal state is leader-owned; native subagents must report evidence upward for the leader to checkpoint.',
+    );
+  }
 }
 
 export interface UltragoalCommandDependencies {
@@ -371,7 +424,7 @@ export async function ultragoalCommand(args: string[], deps: UltragoalCommandDep
       return;
     }
 
-    assertUltragoalMutationAllowedFromCurrentProcess(command);
+    await assertUltragoalMutationAllowedFromCurrentProcess(command, cwd);
 
     if (command === 'create' || command === 'create-goals') {
       const briefFile = readValue(rest, '--brief-file');
