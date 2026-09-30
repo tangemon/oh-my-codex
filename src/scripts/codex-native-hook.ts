@@ -29,6 +29,7 @@ import {
   quarantinePersistedRootAuthority,
   revokeNativeSubagentAuthorities,
   resolveInstalledRoleName,
+  withCrossProcessFileLockSync,
 } from "../subagents/tracker.js";
 
 import { readRoleRoutingMarker, writeRoleRoutingMarker } from "../subagents/role-routing-marker.js";
@@ -908,6 +909,15 @@ async function readJsonIfExists(path: string): Promise<Record<string, unknown> |
   if (!existsSync(path)) return null;
   try {
     return JSON.parse(await readFile(path, "utf-8")) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function readJsonIfExistsSync(path: string): Record<string, unknown> | null {
+  if (!existsSync(path)) return null;
+  try {
+    return JSON.parse(readFileSync(path, "utf-8")) as Record<string, unknown>;
   } catch {
     return null;
   }
@@ -21099,15 +21109,14 @@ async function maybeBuildOrdinaryStopNoProgressOutput(
   };
 }
 
-async function persistNativeStopSignature(
-  stateDir: string,
+function writeNativeStopSignatureLocked(
+  statePath: string,
   payload: CodexHookPayload,
   signature: string,
-  canonicalSessionId?: string,
-): Promise<void> {
-  if (!signature) return;
-  const statePath = join(stateDir, NATIVE_STOP_STATE_FILE);
-  const state = await readJsonIfExists(statePath) ?? {};
+  canonicalSessionId: string | undefined,
+  context: { assertOwnership: () => void; publish: (contents: string) => void },
+): void {
+  const state = readJsonIfExistsSync(statePath) ?? {};
   const sessions = safeObject(state.sessions);
   const sessionKey = readNativeStopSessionKey(payload, canonicalSessionId);
   sessions[sessionKey] = {
@@ -21115,8 +21124,8 @@ async function persistNativeStopSignature(
     last_signature: signature,
     updated_at: new Date().toISOString(),
   };
-  await mkdir(stateDir, { recursive: true });
-  await writeFile(statePath, JSON.stringify({
+  context.assertOwnership();
+  context.publish(JSON.stringify({
     ...state,
     sessions,
   }, null, 2));
@@ -21131,19 +21140,24 @@ async function maybeReturnRepeatableStopOutput(
   options: { allowRepeatDuringStopHook?: boolean } = {},
 ): Promise<Record<string, unknown> | null> {
   if (!output) return null;
+  if (!signature) return null;
   const stopHookActive = payload.stop_hook_active === true || payload.stopHookActive === true;
-  if (stopHookActive && options.allowRepeatDuringStopHook !== true) {
-    const state = await readJsonIfExists(join(stateDir, NATIVE_STOP_STATE_FILE)) ?? {};
+  const statePath = join(stateDir, NATIVE_STOP_STATE_FILE);
+  // Serialize read -> dedupe-check -> write inside one cross-process critical
+  // section so concurrent duplicate Stop replays cannot each observe "no
+  // previous signature" and all emit a repeatable block.
+  return withCrossProcessFileLockSync(statePath, (context) => {
+    const state = readJsonIfExistsSync(statePath) ?? {};
     const previousSignature = readPreviousNativeStopSignature(
       state,
       readNativeStopSessionKey(payload, canonicalSessionId),
     );
-    if (!signature || previousSignature === signature) {
+    if (stopHookActive && options.allowRepeatDuringStopHook !== true && previousSignature === signature) {
       return null;
     }
-  }
-  await persistNativeStopSignature(stateDir, payload, signature, canonicalSessionId);
-  return output;
+    writeNativeStopSignatureLocked(statePath, payload, signature, canonicalSessionId, context);
+    return output;
+  });
 }
 
 async function returnPersistentStopBlock(

@@ -21659,6 +21659,45 @@ exit 0
     }
   });
 
+  it("serializes concurrent duplicate ultrawork Stop replays", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-ultrawork-concurrent-repeat-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const sessionId = "sess-stop-ultrawork-concurrent-repeat";
+      const threadId = "thread-stop-ultrawork-concurrent-repeat";
+      const turnId = "turn-stop-ultrawork-concurrent-repeat";
+      await mkdir(join(stateDir, "sessions", sessionId), { recursive: true });
+      await writeJson(join(stateDir, "sessions", sessionId, "ultrawork-state.json"), {
+        active: true,
+        current_phase: "executing",
+      });
+
+      const payload = {
+        hook_event_name: "Stop",
+        cwd,
+        session_id: sessionId,
+        thread_id: threadId,
+        turn_id: turnId,
+        stop_hook_active: true,
+      };
+      const results = await Promise.all(
+        Array.from({ length: 12 }, () => dispatchCodexNativeHook(payload, { cwd })),
+      );
+
+      assert.equal(
+        results.filter((result) => result.outputJson?.stopReason === "ultrawork_executing").length,
+        1,
+        "only one concurrent replay may emit a repeatable Stop block",
+      );
+      assert.equal(
+        results.filter((result) => result.outputJson === null).length,
+        11,
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("re-blocks active ralplan skill state on repeated Stop hooks", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-skill-repeat-"));
     try {
